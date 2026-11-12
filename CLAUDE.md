@@ -411,9 +411,15 @@ previously carried `SPECIMEN_IDENTIFIER_SYSTEM`, which named the
 just a bare `value` plus an **`assigner`** identifying the requesting
 organisation (`_logical_reference()`, same as the placer order number's
 own `assigner` above) — **Specimen accession number** →
-`Specimen.accessionIdentifier`, **Shipment tracking number** →
+`Specimen.accessionIdentifier`, **Shipment tracking numbers** →
 `Specimen.identifier[ShipmentTrackingNumber]` (LOINC `97209-1`,
-confirmed by that table), **Sample collection/received date** →
+confirmed by that table — a textarea, one per line, each its own
+identifier, since a specimen can carry several), **Container ID** →
+`Specimen.container[].identifier` (also one per line, one container
+each; `FhirClient.as_value_list()` splits/de-dupes both). Loading a saved
+order reads every tracking number/container id back
+(`specimen_tracking_numbers()`/`specimen_container_identifiers()`, also
+Jinja filters — `/order/<id>`'s Samples table shows both as columns), **Sample collection/received date** →
 `Specimen.collection.collectedDateTime`/`Specimen.receivedTime`.
 **Specimen source site and specimen notes are deliberately not
 collected** — removed from the form (they were free text; not worth the
@@ -932,6 +938,36 @@ by day, organisation, indication, ICS, and country.
   - Map div IDs are namespaced (`org-map` for orders, `report-org-map` for
     reports) since both Leaflet maps render on the same page.
 
+### Monthly reports (`/stats/monthly-reports`)
+
+Reports per calendar month (default: just the last full calendar month,
+so the default page load is a single month's search; the current month can
+be picked too, counted up to today) by ICS and report category — "Monthly reports" under
+Management Reports. Queried **one month at a time** (`reports_in_range(...,
+max_pages=MONTHLY_REPORTS_MAX_PAGES)`), so each search stays bounded; a
+month that hits the page cap is flagged on the page as possibly incomplete.
+
+- **ICS and trust both come from the report's ordering organisation**
+  (`order_for_report()` → `order_organisation_resource()`) — trust is
+  that organisation (`"Name (ODS)"`), ICS is `organisation_ics()` on it,
+  the same derivation `/stats`' "Reports by ordering provider's ICS"
+  uses. Each ICS row expands (client-side, hidden by default) into its
+  trusts.
+- **NHS region filter** — `app.NHS_REGION_ICBS`, a hardcoded region →
+  official ICB23NM list (7 regions, 42 ICBs). Picking a region lists
+  *every* ICS in it, zero-filled. `ics_region()` maps any ICS name onto
+  this via the same `_normalize_icb_name()`/`_best_icb_match()` pair the
+  choropleths use.
+- **Categories are inferred from the test code** —
+  `FhirClient.report_category()` (report's own `code`, then its order's),
+  rules documented in its docstring: H&I (Histotrac codes, M118/R428/M242,
+  HLA/chimerism) → pharmacogenomics (DPYD/TPMT/NUDT15/CYP2xx, R454, RX06/
+  RX07) → WGS (M/MX/HX codes as "Cancer Whole Genomic Sequencing", the
+  rest as "Whole Genomic Sequencing") → cytogenomic (karyotype/microarray/FISH/aneuploidy, germline
+  *or* cancer) → remaining M/MX/HX = somatic cancer → remaining R/RX =
+  variant reporting → else unclassified. Not a published mapping — adjust
+  the rules there if a category looks wrong.
+
 ### ctDNA summary (`/ctdna`)
 
 A cross-patient turnaround-time view for **ctDNA** (circulating tumour DNA)
@@ -1223,6 +1259,28 @@ deployment.
     whatever's left of `_CONTENT_WIDTH` (the landscape-A4 page width
     minus both margins) going to Reasons — the one column that actually
     needs room to wrap into.
+
+### Work orders owner (Organization or Device) — ServiceRequest-based
+
+`/work-orders` is back on **ServiceRequest** (`intent=filler-order`,
+`FhirClient.active_filler_orders()`), after a spell on Task
+(`active_filler_tasks()`, still in `fhir_client.py` but no longer called)
+ran into problems on this deployment. It's bounded by `authored`
+(`start`/`end`, default last 30 days), filtered by
+`ServiceRequest.status` (`SERVICE_REQUEST_STATUS_VALUES`, default
+`active`), and scoped by **`ServiceRequest.performer`** — the
+ServiceRequest counterpart of `Task.owner` — picked from
+`FhirClient.TASK_OWNER_OPTIONS`: **K1S6S** (Liverpool GLH Starlims, an
+Organization by ODS code, the default), **DLIMS** (Omics DSS, a `Device`
+found by `Device?identifier=https://fhir.nwgenomics.nhs.uk/Id/laboratory-information-system|DLIMS`),
+or "Any performer" (`?owner=` empty — no performer filter, the date
+bound alone keeps it scoped). `resolve_task_owner()` does the lookup (any
+other `?owner=` value is still treated as an ODS code). **Unconfirmed
+whether this server populates `ServiceRequest.performer` on filler
+orders** — if a known owner shows nothing, try "Any performer".
+`performer_display()`/`_actor_reference_display()` render a Device via
+`device_display()` (deviceName, else identifier). Order Placer Group
+Number comes from `ServiceRequest.requisition`.
 
 ### Work orders (`/work-orders`) & Test orders (`/test-orders`)
 

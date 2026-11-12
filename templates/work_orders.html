@@ -2,15 +2,10 @@
 {% block content %}
   <h1>Work orders</h1>
   <p class="muted">
-    <code>Task</code> resources with <code>intent</code> = "filler-order" —
-    i.e. work items as seen from the filler/lab system's side — owned by
-    the organisation below, filtered by status, and bounded to
-    <code>Task.authoredOn</code> within the date range. Each row falls
-    back to the Task's originating <code>ServiceRequest</code> (via
-    <code>Task.focus</code>) for any field the Task itself doesn't carry.
-    <strong>Business Status</strong> reads <code>Task.businessStatus</code>
-    — not yet populated on this deployment, so it currently shows the
-    Genomic Test Directory code instead, as a placeholder.
+    <code>ServiceRequest</code> resources with <code>intent</code> = "filler-order"
+    — i.e. orders as seen from the filler/lab system's side — whose
+    <code>performer</code> is the owner below, filtered by status, and
+    bounded to <code>ServiceRequest.authoredOn</code> within the date range.
   </p>
 
   {% if error %}
@@ -21,8 +16,16 @@
     <p>
       From <input type="date" name="start" value="{{ start }}">
       to <input type="date" name="end" value="{{ end }}">
-      Owner (ODS code):
-      <input type="text" name="owner" value="{{ owner_ods }}" size="8">
+      Owner:
+      <select name="owner">
+        {% for o in owner_options %}
+          <option value="{{ o.key }}" {% if o.key == owner_ods %}selected{% endif %}>{{ o.label }} ({{ o.key }})</option>
+        {% endfor %}
+        <option value="" {% if not owner_ods %}selected{% endif %}>Any performer</option>
+        {% if owner_ods and owner_ods not in owner_options|map(attribute='key') %}
+          <option value="{{ owner_ods }}" selected>{{ owner_ods }}</option>
+        {% endif %}
+      </select>
       Status:
       <select name="status">
         <option value="" {% if not selected_status %}selected{% endif %}>All</option>
@@ -35,20 +38,22 @@
     </p>
   </form>
 
-  {% if owner_found %}
+  {% if not owner_ods %}
+    <p class="muted">Owner: <strong>any performer</strong></p>
+  {% elif owner_found %}
     <p class="muted">Owner: <strong>{{ owner_display_name }}</strong></p>
   {% else %}
-    <div class="error">No organisation found for ODS code "{{ owner_ods }}".</div>
+    <div class="error">No owner found for "{{ owner_ods }}".</div>
   {% endif %}
 
-  <h2>Active work orders ({{ rows|length }})</h2>
+  <h2>Work orders ({{ rows|length }})</h2>
   {% if rows %}
     {% set next_sort = 'ordered_desc' if sort == 'ordered_asc' else 'ordered_asc' %}
     <table>
       <tr>
-        <th>Patient</th><th>Status</th><th>Business Status</th><th>Intent</th>
+        <th>Patient</th><th>Status</th><th>Test</th><th>Intent</th>
         <th><a href="{{ url_for('work_orders', start=start, end=end, owner=owner_ods, status=selected_status, sort=next_sort) }}">Ordered{% if sort == 'ordered_asc' %} &#9650;{% elif sort == 'ordered_desc' %} &#9660;{% endif %}</a></th>
-        <th>Requested by</th><th>Owner</th><th>Filler ID</th><th>Order Placer Group Number</th><th>Task ID</th>
+        <th>Requested by</th><th>Performer</th><th>Filler ID</th><th>Order Placer Group Number</th><th>Order ID</th>
       </tr>
       {% for row in rows %}
         <tr>
@@ -60,30 +65,18 @@
             {% endif %}
           </td>
           <td>{{ row.status }}</td>
-          <td>{{ row.business_status }}</td>
+          <td>{{ row.test }}</td>
           <td>{{ row.intent }}</td>
           <td>{{ row.ordered }}</td>
           <td>{{ row.requested_by }}</td>
-          <td>{{ row.owner }}</td>
-          <td>
-            {% if row.focus_order_id and row.filler_id != "—" %}
-              <a href="{{ request.script_root }}/order/{{ row.focus_order_id }}">{{ row.filler_id }}</a>
-            {% else %}
-              {{ row.filler_id }}
-            {% endif %}
-          </td>
-          <td>
-            {% if row.focus_order_id and row.group_identifier != "—" %}
-              <a href="{{ request.script_root }}/order/{{ row.focus_order_id }}">{{ row.group_identifier }}</a>
-            {% else %}
-              {{ row.group_identifier }}
-            {% endif %}
-          </td>
-          <td class="muted">{{ row.id }}</td>
+          <td>{{ row.performer }}</td>
+          <td>{{ row.filler_id }}</td>
+          <td>{{ row.group_identifier }}</td>
+          <td><a href="{{ request.script_root }}/order/{{ row.id }}">{{ row.id }}</a></td>
         </tr>
       {% endfor %}
     </table>
   {% else %}
-    <p class="muted">No active filler-order Tasks found for this owner{% if selected_status %} with status "{{ selected_status }}"{% endif %}.</p>
+    <p class="muted">No filler-order ServiceRequests found{% if owner_ods %} for this owner{% endif %}{% if selected_status %} with status "{{ selected_status }}"{% endif %}.</p>
   {% endif %}
 {% endblock %}

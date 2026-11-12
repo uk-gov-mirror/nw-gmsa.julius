@@ -375,6 +375,9 @@ class FhirClient:
                 return [self._get(f"Patient/{patient_id}")]
             except requests.HTTPError:
                 return []
+        # NHS numbers are often typed/pasted in "943 476 5919" form — the
+        # stored identifier value has no spaces, so strip all whitespace.
+        nhs_number = re.sub(r"\s+", "", nhs_number or "")
         if nhs_number:
             # Patients in this IG carry an NHSIdentifier; search by identifier
             # rather than by name for a reliable, unambiguous match.
@@ -677,6 +680,64 @@ class FhirClient:
         filler-order counterpart here). See _active_orders_with_intent()."""
         return self._active_orders_with_intent("order,original-order", start, end)
 
+    #: FHIR R4's own fixed "request-status" ValueSet (ServiceRequest.status)
+    #: — the work orders screen's status filter.
+    SERVICE_REQUEST_STATUS_VALUES = [
+        "draft", "active", "on-hold", "revoked", "completed", "entered-in-error", "unknown",
+    ]
+    DEFAULT_SERVICE_REQUEST_STATUS = "active"
+
+    def active_filler_orders(self, start, end, performer_reference=None, status=DEFAULT_SERVICE_REQUEST_STATUS, max_pages=10):
+        """
+        ServiceRequests with `intent=filler-order` authored within
+        [start, end] — the work orders screen, back on ServiceRequest
+        after active_filler_tasks() (Task) ran into problems on this
+        deployment. `performer_reference` ("Organization/<id>" or
+        "Device/<id>", from resolve_task_owner()) scopes it by
+        ServiceRequest.performer — the ServiceRequest equivalent of
+        Task.owner; None searches every performer. `status` is one
+        SERVICE_REQUEST_STATUS_VALUES entry, or falsy for any status.
+
+        `start`/`end` are required, same reasoning as
+        _active_orders_with_intent()'s (an unbounded system-wide
+        ServiceRequest search is the 413 shape this server has hit
+        before). Same _include shape, category-then-unfiltered fallback,
+        and resourceType-based (not search.mode) result filtering.
+        """
+        base_params = {
+            "intent": "filler-order",
+            "authored": [f"ge{start}", f"le{end}"],
+            "_count": 100,
+            "_include": ["ServiceRequest:specimen", "ServiceRequest:patient",
+                         "ServiceRequest:requester", "ServiceRequest:performer"],
+            "_include:iterate": SERVICE_REQUEST_ITERATE_INCLUDES,
+        }
+        if performer_reference:
+            base_params["performer"] = performer_reference
+        if status:
+            base_params["status"] = status
+        try:
+            matches, included = self._search_all_split(
+                "ServiceRequest", {**base_params, "category": SERVICE_REQUEST_CATEGORY}, max_pages=max_pages)
+        except requests.HTTPError:
+            matches, included = [], []
+        if not matches:
+            matches, included = self._search_all_split("ServiceRequest", base_params, max_pages=max_pages)
+        self._cache_included(matches + included)
+
+        orders_by_id = {
+            o["id"]: o for o in (matches + included)
+            if o.get("resourceType") == "ServiceRequest" and o.get("id")
+        }
+        return list(orders_by_id.values())
+
+    @staticmethod
+    def requisition_identifier(order):
+        """ServiceRequest.requisition's value — the Order Placer Group
+        Number shared by every order placed together (the ServiceRequest
+        counterpart of Task.groupIdentifier)."""
+        return ((order or {}).get("requisition") or {}).get("value")
+
     #: The work orders screen's default Task.owner — the North West GLH's
     #: Liverpool site. Distinct from ORDER_MESSAGE_DESTINATION_ODS
     #: ("699X0", the umbrella NW GLH code used for outbound order
@@ -686,6 +747,37 @@ class FhirClient:
     #: standing up this screen.
     DEFAULT_TASK_OWNER_ODS_CODE = "K1S6S"
     DEFAULT_TASK_OWNER_DISPLAY = "Liverpool GLH"
+
+    #: Local identifier system for a laboratory information system Device
+    #: (e.g. "DLIMS", Omics DSS) — a Task.owner can be a Device rather than
+    #: an Organization when the work sits with a specific LIMS.
+    LABORATORY_INFORMATION_SYSTEM_ID_SYSTEM = "https://fhir.nwgenomics.nhs.uk/Id/laboratory-information-system"
+
+    #: The work orders screen's owner choices, keyed by the value the
+    #: screen's ?owner= param carries. `resource_type` says which resource
+    #: the identifier is looked up on (resolve_task_owner()) — Organization
+    #: by ODS code, or Device by LIMS identifier. The first entry is the
+    #: default.
+    TASK_OWNER_OPTIONS = [
+        {"key": DEFAULT_TASK_OWNER_ODS_CODE, "label": "Liverpool GLH Starlims",
+         "resource_type": "Organization", "system": "https://fhir.nhs.uk/Id/ods-organization-code"},
+        {"key": "DLIMS", "label": "Omics DSS",
+         "resource_type": "Device", "system": LABORATORY_INFORMATION_SYSTEM_ID_SYSTEM},
+    ]
+
+    def resolve_task_owner(self, owner_key):
+        """The Organization/Device resource a work orders ?owner= value
+        identifies — a TASK_OWNER_OPTIONS key, looked up by that option's
+        identifier system, or (for any other value) an ODS code looked up
+        on Organization, so a typed-in ODS code from an old bookmark still
+        works. Returns None if nothing matches."""
+        option = next((o for o in self.TASK_OWNER_OPTIONS if o["key"] == owner_key), None)
+        if option and option["resource_type"] == "Device":
+            bundle = self._get("Device", {"identifier": f"{option['system']}|{owner_key}", "_count": 5})
+            matches = [r for r in self._entries(bundle) if r.get("resourceType") == "Device"]
+            return matches[0] if matches else None
+        matches = self.search_organizations(ods_code=owner_key)
+        return matches[0] if matches else None
 
     #: FHIR R4's own fixed "task-status" ValueSet — hardcoded rather than
     #: deployment-specific, same reasoning as AUDIT_EVENT_ACTIONS. Used by
@@ -720,11 +812,11 @@ class FhirClient:
         resource = self.resolve_reference(focus_ref)
         return resource if resource and resource.get("resourceType") == "ServiceRequest" else None
 
-    def active_filler_tasks(self, owner_organization_id, status=DEFAULT_TASK_STATUS, start=None, end=None, max_pages=10):
+    def active_filler_tasks(self, owner_reference, status=DEFAULT_TASK_STATUS, start=None, end=None, max_pages=10):
         """
         Task resources with `intent=filler-order`, owned by
-        `owner_organization_id` (an Organization's internal FHIR id —
-        resolve one from an ODS code via search_organizations() first) —
+        `owner_reference` ("Organization/<id>" or "Device/<id>" — resolve
+        one via resolve_task_owner() first) —
         the Task-based replacement for the work orders screen, which
         previously used active_filler_orders() (removed) against
         ServiceRequest directly.
@@ -756,7 +848,7 @@ class FhirClient:
         """
         params = {
             "intent": "filler-order",
-            "owner": f"Organization/{owner_organization_id}",
+            "owner": owner_reference,
             "_count": 100,
             "_include": TASK_INCLUDES,
             "_include:iterate": TASK_ITERATE_INCLUDES,
@@ -1309,7 +1401,7 @@ class FhirClient:
         self._cache_included(included)
         return matches
 
-    def reports_in_range(self, start_date, end_date):
+    def reports_in_range(self, start_date, end_date, max_pages=10):
         """All genomic test reports dated within [start_date, end_date]
         (ISO dates), across all patients — used by the daily stats screen.
 
@@ -1329,11 +1421,11 @@ class FhirClient:
         }
         try:
             matches, included = self._search_all_split(
-                "DiagnosticReport", {**params, "category": DIAGNOSTIC_REPORT_CATEGORY})
+                "DiagnosticReport", {**params, "category": DIAGNOSTIC_REPORT_CATEGORY}, max_pages=max_pages)
         except requests.HTTPError:
             matches, included = [], []
         if not matches:
-            matches, included = self._search_all_split("DiagnosticReport", params)
+            matches, included = self._search_all_split("DiagnosticReport", params, max_pages=max_pages)
         self._cache_included(included)
         return matches
 
@@ -2038,6 +2130,48 @@ class FhirClient:
         """The iGene specimen identifier (see SPECIMEN_IDENTIFIER_SYSTEM)."""
         return cls._identifier_value(specimen, cls.SPECIMEN_IDENTIFIER_SYSTEM)
 
+    #: LOINC "Shipment tracking number" — the Specimen profile's
+    #: ShipmentTrackingNumber identifier slice (Specimen.identifier.type).
+    SHIPMENT_TRACKING_NUMBER_LOINC = "97209-1"
+
+    @classmethod
+    def specimen_tracking_numbers(cls, specimen):
+        """Every Specimen.identifier value typed as a shipment tracking
+        number (SHIPMENT_TRACKING_NUMBER_LOINC) — a specimen can carry
+        more than one."""
+        return [
+            ident["value"] for ident in (specimen or {}).get("identifier", [])
+            if ident.get("value") and any(
+                c.get("code") == cls.SHIPMENT_TRACKING_NUMBER_LOINC
+                for c in (ident.get("type") or {}).get("coding", []))
+        ]
+
+    @staticmethod
+    def specimen_container_identifiers(specimen):
+        """Every Specimen.container[].identifier[] value, in order."""
+        return [
+            ident["value"]
+            for container in (specimen or {}).get("container", [])
+            for ident in container.get("identifier", [])
+            if ident.get("value")
+        ]
+
+    @staticmethod
+    def as_value_list(value):
+        """A form value that may hold several entries — a list, or a
+        string with one per line/comma — as a de-duplicated list of
+        non-empty stripped strings, order kept."""
+        if not value:
+            return []
+        parts = value if isinstance(value, (list, tuple)) else re.split(r"[\r\n,]+", value)
+        seen, out = set(), []
+        for p in parts:
+            p = (p or "").strip()
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
     #: England's National Genomic Test Directory CodeSystem — the value set
     #: ServiceRequest.code/DiagnosticReport.code are bound to in this IG (see
     #: module docstring). A CodeableConcept here can carry more than one
@@ -2302,6 +2436,8 @@ class FhirClient:
                 name = (practitioner and self._practitioner_name(practitioner)) or ref.get("display") or "Unknown"
             elif rtype == "Organization":
                 name = resource.get("name") or ref.get("display") or "Unknown"
+            elif rtype == "Device":
+                name = self.device_display(resource) or ref.get("display") or "Unknown"
             else:
                 name = ref.get("display") or resource.get("id") or "Unknown"
 
@@ -3141,6 +3277,9 @@ class FhirClient:
         if rtype == "Practitioner":
             return self._practitioner_display_name(resource) or actor_ref.get("display") or "—"
 
+        if rtype == "Device":
+            return self.device_display(resource) or actor_ref.get("display") or "—"
+
         if rtype == "PractitionerRole":
             practitioner_name = self._resolve_practitioner_display(resource.get("practitioner"))
 
@@ -3157,6 +3296,21 @@ class FhirClient:
 
         # Unexpected resource type — show what we can.
         return actor_ref.get("display") or resource.get("id", "—")
+
+    @staticmethod
+    def device_display(device):
+        """A Device's human-readable name — its first deviceName, falling
+        back to any identifier value (e.g. "DLIMS"). None if it has
+        neither."""
+        if not device:
+            return None
+        for dn in device.get("deviceName", []):
+            if dn.get("name"):
+                return dn["name"]
+        for ident in device.get("identifier", []):
+            if ident.get("value"):
+                return ident["value"]
+        return None
 
     def requester_display(self, order):
         """Display string for ServiceRequest.requester / Task.requester —
@@ -3240,6 +3394,8 @@ class FhirClient:
                 name = (practitioner and self._practitioner_name(practitioner)) or ref.get("display") or "Unknown"
             elif rtype == "Organization":
                 name = resource.get("name") or ref.get("display") or "Unknown"
+            elif rtype == "Device":
+                name = self.device_display(resource) or ref.get("display") or "Unknown"
             else:
                 name = ref.get("display") or resource.get("id") or "Unknown"
 
@@ -3853,6 +4009,95 @@ class FhirClient:
                 return entry["display"]
         return code
 
+    # ---- Monthly reports: report category from the test code ----------
+
+    #: The monthly reports screen's report categories, in display order
+    #: (keys are what report_category() returns). Modelled on HL7
+    #: Genomics Reporting's report types, plus "Variant reporting" for the
+    #: remaining germline (R-code) tests that fit none of the others.
+    REPORT_CATEGORIES = [
+        ("pharmacogenomics", "Pharmacogenomics"),
+        ("wgs", "Whole Genomic Sequencing"),
+        ("cancer_wgs", "Cancer Whole Genomic Sequencing"),
+        ("somatic", "Somatic Cancer"),
+        ("hi", "Histocompatibility and Immunogenetic Reporting"),
+        ("cytogenomic", "Cytogenomic Reporting"),
+        ("variant", "Variant reporting"),
+        ("unclassified", "Unclassified"),
+    ]
+
+    #: Histotrac (the H&I lab system) test codes — anything coded in this
+    #: system is H&I reporting, whatever the code.
+    HISTOTRAC_TEST_CODE_SYSTEM = "https://fhir.nwgenomics.nhs.uk/CodeSystem/Histotrac"
+    #: NW Genomics' own local test codes (RX/MX/HX — tests not in the
+    #: National Genomic Test Directory).
+    NW_TEST_CODE_SYSTEM = "https://fhir.nwgenomics.nhs.uk/CodeSystem/NWTestCode"
+
+    # Inferred from the Test Directory's own display text — there's no
+    # published category per code. Checked in REPORT_CATEGORY_RULES order
+    # below; the first match wins.
+    _HI_CODE_PREFIXES = ("M118.", "R428.", "M242.")  # HSCT chimerism, passenger lymphocyte syndrome
+    _HI_TEXT = re.compile(r"\bHLA\b|chimerism|histocompat|crossmatch|\bDSA\b", re.I)
+    _PGX_CODE_PREFIXES = ("R454.", "RX06.", "RX07.")  # mavacamten CYP2C19, IPTIP, TPMT
+    _PGX_TEXT = re.compile(r"\bDPYD\b|\bTPMT\b|\bNUDT15\b|\bUGT1A1\b|\bCYP2[A-Z]\d|pharmaco", re.I)
+    _WGS_TEXT = re.compile(r"\bWGS\b|whole genome", re.I)
+    _CYTOGENOMIC_TEXT = re.compile(r"karyotyp|microarray|\bFISH\b|aneuploidy|chromosom|cytogen", re.I)
+
+    @classmethod
+    def _test_code_and_display(cls, codeable_concept):
+        """(code, display, system) for the first coding on
+        `codeable_concept` from a test-code system this app recognises
+        (Test Directory, NWTestCode, Histotrac), else (None, None, None).
+        Display falls back to genomic_test_directory_display()'s cached
+        CodeSystem lookup, then the CodeableConcept's own text."""
+        known = (cls.GENOMIC_TEST_DIRECTORY_SYSTEM, cls.NW_TEST_CODE_SYSTEM, cls.HISTOTRAC_TEST_CODE_SYSTEM)
+        for coding in (codeable_concept or {}).get("coding", []):
+            if coding.get("system") in known and coding.get("code"):
+                display = coding.get("display") or (codeable_concept or {}).get("text")
+                if not display and coding["system"] == cls.GENOMIC_TEST_DIRECTORY_SYSTEM:
+                    display = cls.genomic_test_directory_display(coding["code"])
+                return coding["code"], display or "", coding["system"]
+        return None, None, None
+
+    @classmethod
+    def report_category(cls, *codeable_concepts):
+        """REPORT_CATEGORIES key for the first of `codeable_concepts`
+        (typically the report's own `code`, then its originating order's)
+        that carries a recognised test code — "unclassified" if none do.
+
+        The rules are inferred, not published: H&I (Histotrac codes,
+        HSCT chimerism, passenger lymphocyte syndrome, HLA), then
+        pharmacogenomics (DPYD/TPMT/NUDT15/CYP2xx, mavacamten), then WGS
+        (split into cancer WGS for M/MX/HX codes, else rare disease WGS),
+        then cytogenomic techniques (karyotype, microarray, FISH, common
+        aneuploidy — germline *or* cancer), then any remaining M/MX/HX
+        code is somatic cancer and any remaining R/RX code is variant
+        reporting. For M codes, bracketed text is ignored when matching
+        technique keywords — those brackets list gene/variant detail
+        ("...structural variant (To include ... Monosomal karyotype)"),
+        not the test's own technique, unlike an R code's trailing
+        "(Karyotype)"/"(WGS)"."""
+        for cc in codeable_concepts:
+            code, display, system = cls._test_code_and_display(cc)
+            if not code:
+                continue
+            if system == cls.HISTOTRAC_TEST_CODE_SYSTEM:
+                return "hi"
+            text = re.sub(r"\([^)]*\)", "", display) if code.startswith("M") else display
+            if code.startswith(cls._HI_CODE_PREFIXES) or cls._HI_TEXT.search(text):
+                return "hi"
+            if code.startswith(cls._PGX_CODE_PREFIXES) or cls._PGX_TEXT.search(text):
+                return "pharmacogenomics"
+            if cls._WGS_TEXT.search(text):
+                return "cancer_wgs" if code.startswith(("M", "HX")) else "wgs"
+            if cls._CYTOGENOMIC_TEXT.search(text):
+                return "cytogenomic"
+            if code.startswith(("M", "HX")):
+                return "somatic"
+            if code.startswith("R"):
+                return "variant"
+        return "unclassified"
+
     #: This IG's own CodeSystem for clinical indications — confirmed by
     #: the worked example's own ServiceRequest.reasonCode
     #: (https://nw-gmsa.github.io/en/Bundle-GenomicsOrderMessageCodedEntries.html,
@@ -4203,7 +4448,8 @@ class FhirClient:
         test_code, order_number=None, priority="routine", clinical_details=None,
         specimen_type, specimen_date=None, specimen_received_date=None,
         specimen_placer_id=None, specimen_accession_number=None,
-        specimen_tracking_number=None, aoe_answers=None, extra_observations=None,
+        specimen_tracking_number=None, specimen_container_id=None,
+        aoe_answers=None, extra_observations=None,
     ):
         """
         Builds a genomic test order as a FHIR message Bundle
@@ -4280,7 +4526,11 @@ class FhirClient:
         `specimen_placer_id` → `Specimen.identifier[PlacerSpecimenNumber]`,
         `specimen_accession_number` → `Specimen.accessionIdentifier`,
         `specimen_tracking_number` → `Specimen.identifier[ShipmentTrackingNumber]`
-        (LOINC 97209-1, confirmed by that same table), `specimen_date` →
+        (LOINC 97209-1, confirmed by that same table — a string or list;
+        each value becomes its own identifier, since a specimen can carry
+        several, e.g. one per shipment leg), `specimen_container_id` →
+        `Specimen.container[].identifier` (a string or list; one container
+        per value), `specimen_date` →
         `Specimen.collection.collectedDateTime`, `specimen_received_date`
         → `Specimen.receivedTime`. Source site/notes (which that table
         also lists) aren't collected by the form.
@@ -4345,10 +4595,10 @@ class FhirClient:
                 placer_specimen_id["assigner"] = self._logical_reference(
                     self.ODS_ORGANIZATION_CODE_SYSTEM, organization_ods, organization_name)
             specimen_identifiers.append(placer_specimen_id)
-        if specimen_tracking_number:
+        for tracking_number in self.as_value_list(specimen_tracking_number):
             specimen_identifiers.append({
-                "type": {"coding": [{"system": "http://loinc.org", "code": "97209-1", "display": "Shipment tracking number"}]},
-                "value": specimen_tracking_number,
+                "type": {"coding": [{"system": "http://loinc.org", "code": self.SHIPMENT_TRACKING_NUMBER_LOINC, "display": "Shipment tracking number"}]},
+                "value": tracking_number,
             })
         specimen = {
             "resourceType": "Specimen",
@@ -4362,6 +4612,9 @@ class FhirClient:
             specimen["identifier"] = specimen_identifiers
         if specimen_accession_number:
             specimen["accessionIdentifier"] = {"value": specimen_accession_number}
+        container_ids = self.as_value_list(specimen_container_id)
+        if container_ids:
+            specimen["container"] = [{"identifier": [{"value": cid}]} for cid in container_ids]
         if specimen_date:
             specimen["collection"] = {"collectedDateTime": specimen_date}
         if specimen_received_date:
@@ -4823,10 +5076,18 @@ class FhirClient:
                 extracted["specimen_accession_number"] = accession_value
             for ident in specimen.get("identifier", []):
                 type_codes = [c.get("code") for c in (ident.get("type") or {}).get("coding", [])]
-                if "97209-1" in type_codes:
-                    extracted["specimen_tracking_number"] = ident.get("value")
-                elif not ident.get("type"):
+                if cls.SHIPMENT_TRACKING_NUMBER_LOINC in type_codes:
+                    continue  # collected below, all of them
+                elif not ident.get("type") and not extracted.get("specimen_placer_id"):
                     extracted["specimen_placer_id"] = ident.get("value")
+            # Every tracking number / container id, one per line — the
+            # form's textareas take the same shape back.
+            tracking_numbers = cls.specimen_tracking_numbers(specimen)
+            if tracking_numbers:
+                extracted["specimen_tracking_number"] = "\n".join(tracking_numbers)
+            container_ids = cls.specimen_container_identifiers(specimen)
+            if container_ids:
+                extracted["specimen_container_id"] = "\n".join(container_ids)
 
         def is_observation_panel(observation):
             """Whether `observation` is a grouping/"panel" Observation —

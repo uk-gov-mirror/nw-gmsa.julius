@@ -467,6 +467,8 @@ app.jinja_env.filters["obs_value"] = obs_value
 app.jinja_env.filters["specimen_collected"] = specimen_collected
 app.jinja_env.filters["specimen_received"] = specimen_received
 app.jinja_env.filters["specimen_identifier"] = FhirClient.specimen_identifier
+app.jinja_env.filters["specimen_tracking_numbers"] = FhirClient.specimen_tracking_numbers
+app.jinja_env.filters["specimen_container_identifiers"] = FhirClient.specimen_container_identifiers
 app.jinja_env.filters["placer_identifier"] = FhirClient.placer_identifier
 app.jinja_env.filters["filler_identifier"] = FhirClient.filler_identifier
 app.jinja_env.filters["encounter_identifier"] = lambda resource: client.hospital_spell_identifier(resource)
@@ -767,6 +769,7 @@ def order_new():
         "specimen_placer_id": request.form.get("specimen_placer_id", ""),
         "specimen_accession_number": request.form.get("specimen_accession_number", ""),
         "specimen_tracking_number": request.form.get("specimen_tracking_number", ""),
+        "specimen_container_id": request.form.get("specimen_container_id", ""),
     }
     # {link_id: submitted value} for every ASK_AT_ORDER_ENTRY_QUESTIONS
     # field that was actually filled in — read here (not just on POST)
@@ -868,6 +871,7 @@ def order_new():
             "hospital_number", "hospital_spell_id", "test_code", "order_number", "priority", "clinical_details",
             "specimen_type", "specimen_date", "specimen_received_date",
             "specimen_placer_id", "specimen_accession_number", "specimen_tracking_number",
+            "specimen_container_id",
         ):
             if loaded.get(key):
                 form_values[key] = loaded[key]
@@ -888,7 +892,8 @@ def order_new():
         specimen_received_date = form_values["specimen_received_date"].strip() or None
         specimen_placer_id = form_values["specimen_placer_id"].strip() or None
         specimen_accession_number = form_values["specimen_accession_number"].strip() or None
-        specimen_tracking_number = form_values["specimen_tracking_number"].strip() or None
+        specimen_tracking_numbers = FhirClient.as_value_list(form_values["specimen_tracking_number"])
+        specimen_container_ids = FhirClient.as_value_list(form_values["specimen_container_id"])
 
         # Both mandatory per the IG's profiles: ServiceRequest.code (1..1)
         # and Specimen.type (1..1) — see build_order_message_bundle().
@@ -911,7 +916,8 @@ def order_new():
                     specimen_type=specimen_type, specimen_date=specimen_date,
                     specimen_received_date=specimen_received_date,
                     specimen_placer_id=specimen_placer_id, specimen_accession_number=specimen_accession_number,
-                    specimen_tracking_number=specimen_tracking_number,
+                    specimen_tracking_number=specimen_tracking_numbers,
+                    specimen_container_id=specimen_container_ids,
                     aoe_answers={k: v for k, v in aoe_values.items() if v},
                     extra_observations=extra_observations,
                 )
@@ -1679,65 +1685,45 @@ def _order_worklist(fetch_orders):
 @app.route("/work-orders")
 def work_orders():
     """
-    Active filler-order work items — moved from ServiceRequest to Task
-    (Task.status=requested, Task.intent=filler-order), owned by a given
-    Organization (Task.owner) rather than filtered by a "Requested by"
-    organisation dropdown the way the old ServiceRequest-based version
-    was: the fetch itself is now scoped by owner (see
-    client.active_filler_tasks()), defaulting to
-    FhirClient.DEFAULT_TASK_OWNER_ODS_CODE ("K1S6S", "Liverpool GLH").
+    Active filler-order work items — ServiceRequests with
+    intent=filler-order (client.active_filler_orders()), bounded by
+    `authored` to [start, end]. This was briefly Task-based
+    (active_filler_tasks(), Task.owner) but moved back to ServiceRequest
+    because of problems with Task on this deployment.
 
-    This deployment's Task usage for filler-order work items is new,
-    unconfirmed territory (see resolve_task_focus_order()'s docstring) —
-    the Filler ID column falls back to the Task's focus ServiceRequest's
-    own `identifier` wherever the Task itself doesn't carry one directly.
-
-    The Business Status column reads Task.businessStatus (the workflow
-    status a lab attaches to a piece of work, distinct from Task.status'
-    fixed FHIR request-lifecycle state) — this deployment doesn't
-    populate it yet, so it initially falls back to showing the Genomic
-    Test Directory code instead (from the Task's own `code`, or the
-    focus order's), as a placeholder until real business-status values
-    exist to show.
+    The owner picker (FhirClient.TASK_OWNER_OPTIONS — K1S6S Liverpool GLH
+    Starlims by default, or the DLIMS Omics DSS Device) now scopes
+    ServiceRequest.performer, the ServiceRequest counterpart of
+    Task.owner; ?owner= empty means any performer.
     """
     end = request.args.get("end") or date.today().isoformat()
     start = request.args.get("start") or (date.today() - timedelta(days=30)).isoformat()
-    owner_ods = request.args.get("owner") or FhirClient.DEFAULT_TASK_OWNER_ODS_CODE
-    selected_status = request.args.get("status", FhirClient.DEFAULT_TASK_STATUS)
+    owner_ods = request.args.get("owner", FhirClient.DEFAULT_TASK_OWNER_ODS_CODE)
+    selected_status = request.args.get("status", FhirClient.DEFAULT_SERVICE_REQUEST_STATUS)
     sort = request.args.get("sort", "")
 
     error = None
     owner_org = None
     rows = []
     try:
-        owner_matches = client.search_organizations(ods_code=owner_ods)
-        owner_org = owner_matches[0] if owner_matches else None
-        if owner_org:
-            for t in client.active_filler_tasks(owner_org["id"], status=selected_status, start=start, end=end):
-                focus_order = client.resolve_task_focus_order(t)
-                identifier_source = t if t.get("identifier") else (focus_order or {})
-                requester_source = t if t.get("requester") else (focus_order or {})
-                patient = client.patient_for(t) or (client.patient_for(focus_order) if focus_order else None)
-                code = t.get("code") or (focus_order.get("code") if focus_order else None)
-                business_status_source = t.get("businessStatus") or code
-                business_status = (
-                    FhirClient.test_directory_code(business_status_source)
-                    or code_text(business_status_source)
-                    or "—"
-                )
+        owner_org = client.resolve_task_owner(owner_ods) if owner_ods else None
+        if owner_org or not owner_ods:
+            performer_reference = f"{owner_org['resourceType']}/{owner_org['id']}" if owner_org else None
+            for o in client.active_filler_orders(start, end, performer_reference=performer_reference,
+                                                 status=selected_status):
+                patient = client.patient_for(o)
                 rows.append({
-                    "id": t.get("id"),
-                    "focus_order_id": focus_order.get("id") if focus_order else None,
+                    "id": o.get("id"),
                     "patient_id": patient.get("id") if patient else None,
                     "patient_name": human_name(patient) if patient else "Unknown",
-                    "status": t.get("status") or "—",
-                    "business_status": business_status,
-                    "intent": t.get("intent") or "—",
-                    "ordered": t.get("authoredOn") or "—",
-                    "requested_by": client.requester_display(requester_source),
-                    "owner": client.owner_display(t),
-                    "filler_id": FhirClient.filler_identifier(identifier_source) or "—",
-                    "group_identifier": FhirClient.task_group_identifier(t) or "—",
+                    "status": o.get("status") or "—",
+                    "test": FhirClient.test_directory_code(o.get("code")) or code_text(o.get("code")) or "—",
+                    "intent": o.get("intent") or "—",
+                    "ordered": o.get("authoredOn") or "—",
+                    "requested_by": client.requester_display(o),
+                    "performer": client.performer_display(o),
+                    "filler_id": FhirClient.filler_identifier(o) or "—",
+                    "group_identifier": FhirClient.requisition_identifier(o) or "—",
                 })
     except Exception as e:
         error = str(e)
@@ -1745,14 +1731,17 @@ def work_orders():
     if sort in ("ordered_asc", "ordered_desc"):
         rows.sort(key=lambda r: r["ordered"] or "", reverse=(sort == "ordered_desc"))
 
-    owner_name = owner_org.get("name") if owner_org else None
+    if owner_org and owner_org.get("resourceType") == "Device":
+        owner_name = FhirClient.device_display(owner_org)
+    else:
+        owner_name = owner_org.get("name") if owner_org else None
     owner_display_name = (_org_display_name(owner_name, owner_ods) if owner_name else owner_ods) if owner_org else None
 
     return render_template(
         "work_orders.html", rows=rows, sort=sort,
         start=start, end=end, owner_ods=owner_ods, owner_display_name=owner_display_name,
-        owner_found=bool(owner_org),
-        statuses=FhirClient.TASK_STATUS_VALUES, selected_status=selected_status,
+        owner_found=bool(owner_org) or not owner_ods, owner_options=FhirClient.TASK_OWNER_OPTIONS,
+        statuses=FhirClient.SERVICE_REQUEST_STATUS_VALUES, selected_status=selected_status,
         error=error,
     )
 
@@ -2453,6 +2442,242 @@ def stats_ics():
     return render_template(
         "stats_ics.html", ics=ics, start=start, end=end, error=error,
         rows=rows, order_by_test=order_by_test, report_by_test=report_by_test,
+    )
+
+
+#: NHS England region for each ICB, keyed by the official ONS ICB23NM name
+#: (what organisation_ics() returns). Hardcoded — the 42 ICBs and 7
+#: regions have been stable since ICBs were established in July 2022, and
+#: the ONS boundary dataset doesn't carry the region itself.
+NHS_REGION_ICBS = {
+    "North East and Yorkshire": [
+        "NHS Humber and North Yorkshire Integrated Care Board",
+        "NHS North East and North Cumbria Integrated Care Board",
+        "NHS South Yorkshire Integrated Care Board",
+        "NHS West Yorkshire Integrated Care Board",
+    ],
+    "North West": [
+        "NHS Cheshire and Merseyside Integrated Care Board",
+        "NHS Greater Manchester Integrated Care Board",
+        "NHS Lancashire and South Cumbria Integrated Care Board",
+    ],
+    "Midlands": [
+        "NHS Birmingham and Solihull Integrated Care Board",
+        "NHS Black Country Integrated Care Board",
+        "NHS Coventry and Warwickshire Integrated Care Board",
+        "NHS Derby and Derbyshire Integrated Care Board",
+        "NHS Herefordshire and Worcestershire Integrated Care Board",
+        "NHS Leicester, Leicestershire and Rutland Integrated Care Board",
+        "NHS Lincolnshire Integrated Care Board",
+        "NHS Northamptonshire Integrated Care Board",
+        "NHS Nottingham and Nottinghamshire Integrated Care Board",
+        "NHS Shropshire, Telford and Wrekin Integrated Care Board",
+        "NHS Staffordshire and Stoke-on-Trent Integrated Care Board",
+    ],
+    "East of England": [
+        "NHS Bedfordshire, Luton and Milton Keynes Integrated Care Board",
+        "NHS Cambridgeshire and Peterborough Integrated Care Board",
+        "NHS Hertfordshire and West Essex Integrated Care Board",
+        "NHS Mid and South Essex Integrated Care Board",
+        "NHS Norfolk and Waveney Integrated Care Board",
+        "NHS Suffolk and North East Essex Integrated Care Board",
+    ],
+    "London": [
+        "NHS North Central London Integrated Care Board",
+        "NHS North East London Integrated Care Board",
+        "NHS North West London Integrated Care Board",
+        "NHS South East London Integrated Care Board",
+        "NHS South West London Integrated Care Board",
+    ],
+    "South East": [
+        "NHS Buckinghamshire, Oxfordshire and Berkshire West Integrated Care Board",
+        "NHS Frimley Integrated Care Board",
+        "NHS Hampshire and Isle of Wight Integrated Care Board",
+        "NHS Kent and Medway Integrated Care Board",
+        "NHS Surrey Heartlands Integrated Care Board",
+        "NHS Sussex Integrated Care Board",
+    ],
+    "South West": [
+        "NHS Bath and North East Somerset, Swindon and Wiltshire Integrated Care Board",
+        "NHS Bristol, North Somerset and South Gloucestershire Integrated Care Board",
+        "NHS Cornwall and the Isles of Scilly Integrated Care Board",
+        "NHS Devon Integrated Care Board",
+        "NHS Dorset Integrated Care Board",
+        "NHS Gloucestershire Integrated Care Board",
+        "NHS Somerset Integrated Care Board",
+    ],
+}
+
+
+def ics_region(ics_name):
+    """(official ICB name, NHS region) for an ICS name — exact match on
+    NHS_REGION_ICBS first, then the same normalise/fuzzy match the /stats
+    choropleth uses (_normalize_icb_name()/_best_icb_match()), so a
+    differently-worded name still lands on the right ICB. (ics_name,
+    None) if it matches no ICB (including "Unknown"). Memoised per name —
+    called once per report on the monthly report."""
+    if ics_name in _ics_region_cache:
+        return _ics_region_cache[ics_name]
+    by_norm = {
+        _normalize_icb_name(icb): (icb, region)
+        for region, icbs in NHS_REGION_ICBS.items() for icb in icbs
+    }
+    norm = _normalize_icb_name(ics_name)
+    best = norm if norm in by_norm else _best_icb_match(norm, by_norm.keys())
+    _ics_region_cache[ics_name] = by_norm[best] if best else (ics_name, None)
+    return _ics_region_cache[ics_name]
+
+
+_ics_region_cache = {}
+
+
+def short_icb_name(icb_name):
+    """"NHS Greater Manchester Integrated Care Board" -> "Greater
+    Manchester" — just for column/row labels on the monthly report."""
+    n = re.sub(r"^NHS\s+", "", icb_name or "")
+    return re.sub(r"\s+Integrated Care Board$", "", n)
+
+
+def _month_range(start_month, end_month):
+    """Every "YYYY-MM" from start_month to end_month inclusive."""
+    y, m = map(int, start_month.split("-"))
+    ey, em = map(int, end_month.split("-"))
+    months = []
+    while (y, m) <= (ey, em):
+        months.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return months
+
+
+#: Upper bound on how many months /stats/monthly-reports will query in one
+#: go — each month is its own reports_in_range() search.
+MONTHLY_REPORTS_MAX_MONTHS = 24
+#: Pages (of 100) fetched per month — a month whose report count reaches
+#: this many pages is flagged as possibly truncated.
+MONTHLY_REPORTS_MAX_PAGES = 20
+
+
+@app.route("/stats/monthly-reports")
+def monthly_reports():
+    """
+    Genomic test reports per calendar month (default: the last full month
+    only; the current month can be picked too, counted up to today), by ICS and report category, filterable by NHS region and
+    category, with each ICS expandable into its NHS trusts.
+
+    ICS and trust are both from the report's *ordering* organisation
+    (order_for_report() -> order_organisation_resource()), the same
+    "Reports by ordering provider's ICS" derivation /stats uses — the trust
+    is the requesting organisation, the ICS is the ICB its postcode falls
+    in (organisation_ics()). Category is FhirClient.report_category() on
+    the report's own code, falling back to its originating order's.
+
+    Queried one month at a time (reports_in_range() per month) rather than
+    one big range, so each search stays bounded — see "413s on unfiltered
+    system-wide searches" in CLAUDE.md.
+    """
+    today = date.today()
+    this_month = today.strftime("%Y-%m")
+    # Default to just the last full calendar month — one month's search,
+    # not a year's worth; widen with start_month/end_month when needed.
+    last_full_month = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    end_month = request.args.get("end_month") or last_full_month
+    start_month = request.args.get("start_month") or last_full_month
+    selected_region = request.args.get("region", "")
+    selected_category = request.args.get("category", "")
+
+    error = None
+    months = []
+    try:
+        months = _month_range(start_month, min(end_month, this_month))
+    except ValueError:
+        error = "Months must be in YYYY-MM format."
+    if len(months) > MONTHLY_REPORTS_MAX_MONTHS:
+        error = f"Pick at most {MONTHLY_REPORTS_MAX_MONTHS} months."
+        months = []
+
+    category_labels = dict(FhirClient.REPORT_CATEGORIES)
+    # ics -> month -> category -> count; ics -> trust -> month -> category -> count
+    ics_counts, trust_counts = {}, {}
+    truncated_months = []
+    try:
+        seen = set()
+        for month in months:
+            y, m = map(int, month.split("-"))
+            month_start = date(y, m, 1)
+            month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            month_end = min(month_end, today)
+            reports = client.reports_in_range(month_start.isoformat(), month_end.isoformat(),
+                                              max_pages=MONTHLY_REPORTS_MAX_PAGES)
+            if len(reports) >= MONTHLY_REPORTS_MAX_PAGES * 100:
+                truncated_months.append(month)
+            for r in reports:
+                if r.get("id") in seen:
+                    continue
+                seen.add(r.get("id"))
+                order = client.order_for_report(r)
+                org = client.order_organisation_resource(order) if order else None
+                ics, _ = ics_region(client.organisation_ics(org) or "Unknown")
+                trust_name = (org.get("name") if org else None) or (client.order_organisation(order) if order else None)
+                trust = _org_display_name(trust_name, client.organisation_ods_code(org) if org else None) if trust_name else "Unknown"
+                category = FhirClient.report_category(r.get("code"), order.get("code") if order else None)
+                by_cat = ics_counts.setdefault(ics, {}).setdefault(month, {})
+                by_cat[category] = by_cat.get(category, 0) + 1
+                by_cat = trust_counts.setdefault(ics, {}).setdefault(trust, {}).setdefault(month, {})
+                by_cat[category] = by_cat.get(category, 0) + 1
+    except Exception as e:
+        error = str(e)
+
+    def count(month_cats, month):
+        cats = month_cats.get(month, {})
+        if selected_category:
+            return cats.get(selected_category, 0)
+        return sum(cats.values())
+
+    # Every ICB in the selected region (or all regions) is listed, zero-filled,
+    # so a region view shows its whole ICS list; ICS names that didn't match
+    # an ICB (incl. "Unknown") only appear in the all-regions view.
+    if selected_region:
+        ics_list = list(NHS_REGION_ICBS.get(selected_region, []))
+    else:
+        ics_list = [icb for icbs in NHS_REGION_ICBS.values() for icb in icbs]
+        ics_list += sorted(i for i in ics_counts if i not in ics_list)
+
+    ics_rows = []
+    for ics in ics_list:
+        month_cats = ics_counts.get(ics, {})
+        trusts = []
+        for trust, trust_month_cats in sorted(trust_counts.get(ics, {}).items()):
+            trust_months = [count(trust_month_cats, mo) for mo in months]
+            if sum(trust_months):
+                trusts.append({"name": trust, "months": trust_months, "total": sum(trust_months)})
+        trusts.sort(key=lambda t: -t["total"])
+        ics_months = [count(month_cats, mo) for mo in months]
+        ics_rows.append({
+            "name": ics, "label": short_icb_name(ics), "region": ics_region(ics)[1] or "—",
+            "months": ics_months, "total": sum(ics_months), "trusts": trusts,
+        })
+
+    month_totals = [sum(r["months"][i] for r in ics_rows) for i in range(len(months))]
+
+    # Category x month for the ICS list above (region filter applied,
+    # category filter not — this table *is* the category breakdown).
+    category_rows = []
+    for key, label in FhirClient.REPORT_CATEGORIES:
+        cat_months = [
+            sum(ics_counts.get(ics, {}).get(mo, {}).get(key, 0) for ics in ics_list)
+            for mo in months
+        ]
+        if key != "unclassified" or sum(cat_months):
+            category_rows.append({"key": key, "label": label, "months": cat_months, "total": sum(cat_months)})
+
+    return render_template(
+        "monthly_reports.html", error=error,
+        start_month=start_month, end_month=end_month, months=months,
+        regions=list(NHS_REGION_ICBS), selected_region=selected_region,
+        categories=FhirClient.REPORT_CATEGORIES, selected_category=selected_category,
+        selected_category_label=category_labels.get(selected_category),
+        ics_rows=ics_rows, month_totals=month_totals, category_rows=category_rows,
+        truncated_months=truncated_months,
     )
 
 

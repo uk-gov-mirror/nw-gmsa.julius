@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Monthly reports</h1>
+  <p class="muted">
+    Genomic test reports per calendar month — defaults to the last full
+    month; widen the range to compare months (the current month runs to
+    today), by the ICS of the <em>ordering</em> organisation. Report
+    categories are inferred from each report's test code (falling back to
+    its originating order's). Click an ICS to show its NHS trusts.
+  </p>
+
+  <form action="{{ request.script_root }}/stats/monthly-reports" method="get">
+    <p>
+      From <input type="month" name="start_month" value="{{ start_month }}">
+      to <input type="month" name="end_month" value="{{ end_month }}">
+      NHS region:
+      <select name="region">
+        <option value="" {% if not selected_region %}selected{% endif %}>All regions</option>
+        {% for r in regions %}
+          <option value="{{ r }}" {% if r == selected_region %}selected{% endif %}>{{ r }}</option>
+        {% endfor %}
+      </select>
+      Category:
+      <select name="category">
+        <option value="" {% if not selected_category %}selected{% endif %}>All categories</option>
+        {% for key, label in categories %}
+          <option value="{{ key }}" {% if key == selected_category %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Update</button>
+    </p>
+  </form>
+
+  {% if error %}
+    <div class="error"><strong>Request failed:</strong> {{ error }}</div>
+  {% endif %}
+  {% if truncated_months %}
+    <div class="error">
+      Hit the per-month fetch limit for {{ truncated_months|join(", ") }} — counts for
+      {{ "that month" if truncated_months|length == 1 else "those months" }} may be incomplete.
+    </div>
+  {% endif %}
+
+  {% if months %}
+    <h2>Reports by category{% if selected_region %} — {{ selected_region }}{% endif %}</h2>
+    <div style="overflow-x: auto;">
+      <table>
+        <tr><th>Category</th>{% for m in months %}<th>{{ m }}</th>{% endfor %}<th>Total</th></tr>
+        {% for row in category_rows %}
+          <tr>
+            <td>{{ row.label }}</td>
+            {% for n in row.months %}<td>{{ n }}</td>{% endfor %}
+            <td><strong>{{ row.total }}</strong></td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    <h2>Reports by ICS{% if selected_region %} — {{ selected_region }}{% endif %}{% if selected_category_label %} — {{ selected_category_label }}{% endif %}</h2>
+    <div style="overflow-x: auto;">
+      <table>
+        <tr>
+          <th>ICS</th>{% if not selected_region %}<th>Region</th>{% endif %}
+          {% for m in months %}<th>{{ m }}</th>{% endfor %}<th>Total</th>
+        </tr>
+        {% for row in ics_rows %}
+          {% if selected_region or row.total or row.region != "—" %}
+          <tr>
+            <td>
+              {% if row.trusts %}
+                <a href="#" class="ics-toggle" data-ics="{{ loop.index }}" onclick="toggleTrusts(this); return false;">&#9656; {{ row.label }}</a>
+              {% else %}
+                {{ row.label }}
+              {% endif %}
+            </td>
+            {% if not selected_region %}<td class="muted">{{ row.region }}</td>{% endif %}
+            {% for n in row.months %}<td>{{ n }}</td>{% endfor %}
+            <td><strong>{{ row.total }}</strong></td>
+          </tr>
+          {% set ics_index = loop.index %}
+          {% for t in row.trusts %}
+            <tr class="trust-row" data-ics="{{ ics_index }}" hidden style="background: #fafbfd;">
+              <td style="padding-left: 28px;">{{ t.name }}</td>
+              {% if not selected_region %}<td></td>{% endif %}
+              {% for n in t.months %}<td>{{ n }}</td>{% endfor %}
+              <td>{{ t.total }}</td>
+            </tr>
+          {% endfor %}
+          {% endif %}
+        {% endfor %}
+        <tr>
+          <th>Total</th>{% if not selected_region %}<th></th>{% endif %}
+          {% for n in month_totals %}<th>{{ n }}</th>{% endfor %}
+          <th>{{ month_totals|sum }}</th>
+        </tr>
+      </table>
+    </div>
+  {% endif %}
+
+  <script>
+    function toggleTrusts(link) {
+      var rows = document.querySelectorAll('tr.trust-row[data-ics="' + link.dataset.ics + '"]');
+      var show = rows.length && rows[0].hidden;
+      rows.forEach(function (r) { r.hidden = !show; });
+      link.innerHTML = (show ? '&#9662; ' : '&#9656; ') + link.textContent.slice(2);
+    }
+  </script>
+{% endblock %}

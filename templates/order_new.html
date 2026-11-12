@@ -306,8 +306,18 @@
           <td><input type="text" name="specimen_accession_number" value="{{ form_values.specimen_accession_number }}" style="width: 100%; max-width: 300px;"></td>
         </tr>
         <tr>
-          <th>Shipment tracking number</th>
-          <td><input type="text" name="specimen_tracking_number" value="{{ form_values.specimen_tracking_number }}" style="width: 100%; max-width: 300px;"></td>
+          <th>Container ID</th>
+          <td>
+            <textarea name="specimen_container_id" rows="2" style="width: 100%; max-width: 300px;">{{ form_values.specimen_container_id }}</textarea>
+            <p class="muted">One per line — each becomes a <code>Specimen.container.identifier</code>.</p>
+          </td>
+        </tr>
+        <tr>
+          <th>Shipment tracking numbers</th>
+          <td>
+            <textarea name="specimen_tracking_number" rows="2" style="width: 100%; max-width: 300px;">{{ form_values.specimen_tracking_number }}</textarea>
+            <p class="muted">One per line — each becomes its own <code>Specimen.identifier</code> (LOINC 97209-1).</p>
+          </td>
         </tr>
       </table>
 

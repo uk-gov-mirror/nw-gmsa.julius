@@ -60,13 +60,15 @@
     <h2>Samples</h2>
     {% if specimens %}
       <table>
-        <tr><th>Type</th><th>Collection date</th><th>Received date</th><th>Specimen identifier</th><th>ID</th><th></th></tr>
+        <tr><th>Type</th><th>Collection date</th><th>Received date</th><th>Specimen identifier</th><th>Container ID</th><th>Shipment tracking</th><th>ID</th><th></th></tr>
         {% for s in specimens %}
           <tr>
             <td>{{ s.type|code_text }}</td>
             <td>{{ s|specimen_collected }}</td>
             <td>{{ s|specimen_received }}</td>
             <td>{{ (s|specimen_identifier) or "—" }}</td>
+            <td>{{ (s|specimen_container_identifiers)|join(", ") or "—" }}</td>
+            <td>{{ (s|specimen_tracking_numbers)|join(", ") or "—" }}</td>
             <td class="muted">{{ s.id }}</td>
             <td>
               <button type="button" onclick="showFhirResource('specimen-data-{{ loop.index }}', 'Specimen/{{ s.id }}')">View FHIR/V2</button>
