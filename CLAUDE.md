@@ -813,10 +813,14 @@ all (not just no ODS code).
 
 Queries `ServiceRequest`/`DiagnosticReport` system-wide for a date range
 (default: last 7 days) via `authored`/`date` search params, using
-`_search_all_split()` to follow `Bundle.link[rel=next]` pages (capped at
-`max_pages=10`, i.e. 1,000 records per resource type per query — raise
-`max_pages` if a high-volume range silently hits the cap). Breaks results down
-by day, organisation, indication, ICS, and country.
+`_search_all_split()` to follow `Bundle.link[rel=next]` pages, capped at
+`app.STATS_MAX_PAGES` = 100 pages per resource type (10,000 records at
+`_count=100`; raised from 10). `app._stats_fetch()` does both searches for
+`/stats`, `/stats/organisation` and `/stats/ics`, and each page shows a
+"may be incomplete — narrow the date range" warning when either search
+stopped at the cap with pages left (`FhirClient.last_search_truncated`,
+not a result-count check — see the monthly report section). Breaks results
+down by day, organisation, indication, ICS, and country.
 
 - **`orders_in_range()` bundles only patient; `reports_in_range()` only
   patient/performer — one hop each, deliberately no requester chain and
@@ -958,7 +962,8 @@ by day, organisation, indication, ICS, and country.
 
 ### Monthly reports (`/stats/monthly-reports`)
 
-Reports per calendar month (default: just the last full calendar month,
+**Coverage: iGene and Shire reports only — not StarLIMS** (stated on the
+page itself too). Reports per calendar month (default: just the last full calendar month,
 so the default page load is a single month's search; the current month can
 be picked too, counted up to today) by ICS and report category — "Monthly reports" under
 Management Reports. Queried **one month at a time** (`reports_in_range(...,
@@ -993,6 +998,32 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   everything lands in "Unknown", sample a real report's `encounter`/
   `basedOn`. Each ICS row expands (client-side, hidden by default) into
   its trusts.
+- **One row per trust** — `app._canonical_org()` swaps whatever
+  Organization a report/order resolved to for `organisation_by_ods()` on
+  its ODS code, and `_org_name()` title-cases an all-capitals name.
+  Without this the same trust appeared twice (same ODS code, "MANCHESTER
+  UNIVERSITY NHS FOUNDATION TRUST" from this server's own Organization via
+  a resolved requester reference, and the ODS trust list's mixed-case
+  name via an ODS code on the order), since rows group by name. Used by
+  `_order_ordering()`/`_report_ordering()`, so daily stats gets it too.
+- **"Download as PDF"** (`/stats/monthly-reports/pdf`, same query string
+  as the page) — `pdf_report.monthly_report_pdf_bytes()`, reportlab,
+  landscape A4, same pattern as `/data-quality/pdf`. Both routes build
+  their data via `app._build_monthly_report()` (the page's template
+  context), so they can't disagree; `_monthly_report_context()` caches each
+  login's last result per query string for `MONTHLY_REPORT_CACHE_SECONDS`
+  (10 min) so downloading straight after viewing doesn't re-run every
+  search. The PDF writes out what the page hides behind clicks: every
+  ICS's trusts are listed (indented) under it, and a final "Categories by
+  ICS" section gives each ICS's category breakdown (the popup), each kept
+  on one page.
+- **"Categories" popup** — a button on every ICS and trust row opens a
+  native `<dialog>` (`#category-dialog`, `monthly_reports.html`) with that
+  row's reports by category × month, plus totals. Built from counts the
+  route already has (`category_breakdown()` in `app.monthly_reports()`,
+  embedded per button as `data-breakdown` via `tojson`) — no extra
+  searches. Always all categories, regardless of the category filter;
+  categories with no reports are left out.
 - **NHS region filter** — regions are `FhirClient.NHS_REGION_NAMES`
   (the 7 ODS `Yxx` codes); the ICSs in each come from
   `FhirClient.icbs_by_region()` (every open trust's ICB in ODS's trust
@@ -1007,7 +1038,10 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   RX07) → WGS (M/MX/HX codes as "Cancer Whole Genomic Sequencing", the
   rest as "Whole Genomic Sequencing") → cytogenomic (karyotype/microarray/FISH/aneuploidy, germline
   *or* cancer) → remaining M/MX/HX = somatic cancer → remaining R/RX =
-  variant reporting → else unclassified. Not a published mapping — adjust
+  variant reporting → else unclassified. A CodeableConcept with no
+  recognised test code can still match a LOINC code in
+  `FhirClient.LOINC_REPORT_CATEGORIES` (`33893-9`, bone marrow karyotype →
+  cytogenomic) — add more there as they turn up in "Unclassified". Not a published mapping — adjust
   the rules there if a category looks wrong.
 
 ### ICS from the ODS trust → ICB mapping

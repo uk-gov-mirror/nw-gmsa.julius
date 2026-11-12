@@ -37,6 +37,12 @@
   {% if error %}
     <div class="error"><strong>Request failed:</strong> {{ error }}</div>
   {% endif %}
+  {% if truncated %}
+    <div class="error">
+      Hit the fetch limit ({{ max_pages }} pages) for {{ truncated|join(" and ") }} in this
+      date range — counts may be incomplete. Narrow the date range to see everything.
+    </div>
+  {% endif %}
 
   <p class="muted">{{ order_count }} orders and {{ report_count }} reports in this range.</p>
 

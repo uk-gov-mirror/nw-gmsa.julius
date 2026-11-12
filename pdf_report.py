@@ -1,6 +1,7 @@
 """
 Renders the /data-quality report (the dict shape IrisClient.build_report()
-in iris_client.py returns) to a downloadable PDF, via reportlab. The only
+in iris_client.py returns) and the /stats/monthly-reports report (see
+monthly_report_pdf_bytes()) to downloadable PDFs, via reportlab. The only
 place in this app that *generates* a PDF, as opposed to serving one
 straight off the FHIR server (see fetch_attachment_bytes() in
 fhir_client.py for that — a report's presentedForm PDF, already made by
@@ -20,7 +21,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 _STYLES = getSampleStyleSheet()
 _CELL_STYLE = ParagraphStyle("TableCell", parent=_STYLES["Normal"], fontSize=8, leading=10)
@@ -193,6 +194,130 @@ def quality_report_pdf_bytes(report, start, end, score_threshold, iris_host, iri
             row.append(_reasons_cell(entry.get("reasons")))
             rows.append(row)
         story.append(_entries_table(display_columns, rows))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def _name_cell(text, indent=0):
+    """A wrapping name cell (ICS/trust/category names can be long) —
+    escaped, since Paragraph text is interpreted as reportlab markup."""
+    style = ParagraphStyle("NameCell", parent=_CELL_STYLE, leftIndent=indent)
+    return Paragraph(escape(text or "—"), style)
+
+
+def _count_table(header, body_rows, total_row, name_width, extra_widths=(), trust_rows=()):
+    """A name + counts table (name column, any `extra_widths` columns,
+    then one column per month plus Total) with a bold total row. Months
+    share whatever width is left. `trust_rows` are body row indexes
+    (0-based, header excluded) drawn as indented, shaded sub-rows."""
+    n_counts = len(header) - 1 - len(extra_widths)
+    count_width = max((_CONTENT_WIDTH - name_width - sum(extra_widths)) / max(n_counts, 1), 28)
+    col_widths = [name_width, *extra_widths] + [count_width] * n_counts
+    rows = [header] + body_rows + ([total_row] if total_row else [])
+    t = Table(rows, colWidths=col_widths, repeatRows=1)
+    style = list(_TABLE_STYLE.getCommands())
+    style.append(("ALIGN", (1 + len(extra_widths), 0), (-1, -1), "RIGHT"))
+    if total_row:
+        style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                  ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f0f0f0"))]
+    for i in trust_rows:
+        style += [("BACKGROUND", (0, i + 1), (-1, i + 1), colors.HexColor("#fafbfd")),
+                  ("TEXTCOLOR", (0, i + 1), (-1, i + 1), colors.HexColor("#444444"))]
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def monthly_report_pdf_bytes(report):
+    """Build the PDF for the /stats/monthly-reports page and return its
+    bytes. `report` is app._build_monthly_report()'s context dict — the
+    same one the HTML page renders, so the two always match. Sections
+    follow the page (coverage note, warnings, reports by category with a
+    total, reports by ICS), except that what the page hides behind clicks
+    is written out in full: every ICS's trusts are listed under it, and a
+    final "Categories by ICS" section gives each ICS's category breakdown
+    (the page's Categories popup)."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=landscape(A4),
+        leftMargin=_PAGE_MARGIN, rightMargin=_PAGE_MARGIN, topMargin=_PAGE_MARGIN, bottomMargin=_PAGE_MARGIN,
+        title="Monthly reports",
+    )
+    months = report.get("months") or []
+    region = report.get("selected_region")
+    category_label = report.get("selected_category_label")
+    span = f"{months[0]} to {months[-1]}" if len(months) > 1 else (months[0] if months else "—")
+    filters = [f"Months: {span}", f"NHS region: {region or 'All regions'}",
+               f"Category: {category_label or 'All categories'}"]
+    story = [
+        _para("Monthly reports", "Title"),
+        _para(" &middot; ".join(escape(f) for f in filters)),
+        _para("Genomic test reports per calendar month, by the ICS of the <i>ordering</i> organisation. "
+              "<b>Coverage:</b> reports from iGene and Shire only &mdash; StarLIMS reports aren't included."),
+        Spacer(1, 8),
+    ]
+
+    if report.get("error"):
+        story.append(_para(f"<b>Request failed:</b> {escape(report['error'])}"))
+    if report.get("truncated_months"):
+        story.append(_para(
+            f"<b>Hit the fetch limit</b> (searched a week at a time, up to {report.get('max_pages')} pages per week) "
+            f"for {escape(', '.join(report['truncated_months']))} &mdash; counts may be incomplete."))
+    if not months:
+        doc.build(story)
+        return buffer.getvalue()
+
+    month_header = list(months) + ["Total"]
+
+    story.append(_para(f"Reports by category{escape(' — ' + region) if region else ''}", "Heading2"))
+    category_rows = report.get("category_rows") or []
+    totals = report.get("category_month_totals") or [0] * len(months)
+    story.append(_count_table(
+        ["Category"] + month_header,
+        [[_name_cell(r["label"])] + r["months"] + [r["total"]] for r in category_rows],
+        ["Total"] + totals + [sum(totals)],
+        name_width=200,
+    ))
+
+    heading = "Reports by ICS" + (f" — {region}" if region else "") + (f" — {category_label}" if category_label else "")
+    story.append(_para(escape(heading), "Heading2"))
+    show_region = not region
+    body, trust_rows = [], []
+    for row in report.get("ics_rows") or []:
+        # Same rows the page shows: every ICS in a region view; in the
+        # all-regions view, current ICSs plus anything else with reports.
+        if not (region or row["total"] or row["region"] != "—"):
+            continue
+        body.append([_name_cell(row["label"])] + ([row["region"]] if show_region else []) + row["months"] + [row["total"]])
+        for t in row["trusts"]:
+            trust_rows.append(len(body))
+            body.append([_name_cell(t["name"], indent=10)] + ([""] if show_region else []) + t["months"] + [t["total"]])
+    month_totals = report.get("month_totals") or [0] * len(months)
+    story.append(_count_table(
+        ["ICS / NHS trust"] + (["Region"] if show_region else []) + month_header,
+        body,
+        ["Total"] + ([""] if show_region else []) + month_totals + [sum(month_totals)],
+        name_width=230, extra_widths=(105,) if show_region else (), trust_rows=trust_rows,
+    ))
+
+    breakdowns = [r for r in (report.get("ics_rows") or []) if r.get("categories")]
+    if breakdowns:
+        story.append(PageBreak())
+        story.append(_para("Categories by ICS", "Heading2"))
+        story.append(_para("Each ICS's reports by category (all categories, whatever the category filter)."))
+        for row in breakdowns:
+            cat_totals = [sum(c["months"][i] for c in row["categories"]) for i in range(len(months))]
+            # Heading + table kept on one page — at most 8 short rows.
+            story.append(KeepTogether([
+                Spacer(1, 6),
+                _para(f"<b>{escape(row['name'])}</b>"),
+                _count_table(
+                    ["Category"] + month_header,
+                    [[_name_cell(c["label"])] + c["months"] + [c["total"]] for c in row["categories"]],
+                    ["Total"] + cat_totals + [sum(cat_totals)],
+                    name_width=200,
+                ),
+            ]))
 
     doc.build(story)
     return buffer.getvalue()

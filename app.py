@@ -4,6 +4,7 @@ import json
 import secrets
 import difflib
 import threading
+import time
 from datetime import date, timedelta
 from flask import Flask, render_template, request, Response, abort, redirect, session, g, url_for
 from werkzeug.local import LocalProxy
@@ -13,7 +14,7 @@ import plotly.express as px
 from dotenv import load_dotenv
 from fhir_client import FhirClient
 from iris_client import IrisClient
-from pdf_report import quality_report_pdf_bytes
+from pdf_report import monthly_report_pdf_bytes, quality_report_pdf_bytes
 from epic_client import EpicClient, EPIC_FHIR_BASE_URL_DEFAULT, KNOWN_SANDBOX_TEST_PATIENTS
 
 # Loads .env into the process environment (FHIR_BASE_URL, ESB_*, EPIC_*, ...)
@@ -2157,6 +2158,52 @@ def group_rows_by_organisation(rows):
     return [(org, groups[org]) for org in orgs]
 
 
+#: Pages fetched by the daily stats screens' order and report searches —
+#: up to 10,000 of each at _count=100 (raised from the default 10 /
+#: 1,000). Hitting it shows a "may be incomplete" warning (_stats_fetch()).
+STATS_MAX_PAGES = 100
+
+
+def _stats_fetch(start, end):
+    """orders_in_range() + reports_in_range() for the /stats screens, at
+    STATS_MAX_PAGES — returns (orders, reports, truncated), `truncated`
+    listing which of "orders"/"reports" stopped at the cap with pages left
+    (client.last_search_truncated, read straight after each search, since
+    any later search overwrites it)."""
+    truncated = []
+    orders = client.orders_in_range(start, end, max_pages=STATS_MAX_PAGES)
+    if client.last_search_truncated:
+        truncated.append("orders")
+    reports = client.reports_in_range(start, end, max_pages=STATS_MAX_PAGES)
+    if client.last_search_truncated:
+        truncated.append("reports")
+    return orders, reports, truncated
+
+
+def _canonical_org(org):
+    """One record per organisation on the /stats screens: an
+    Organization reached by any route (ODS code off the order/report, or
+    a resolved requester reference to this FHIR server's own
+    Organization) is swapped for client.organisation_by_ods() on its ODS
+    code — the ODS trust list's record for an NHS trust. Without this the
+    same trust showed twice in the monthly report: once from the ODS list
+    ("Manchester University NHS Foundation Trust") and once from the
+    server's own Organization ("MANCHESTER UNIVERSITY NHS FOUNDATION
+    TRUST"), since rows are grouped by name. Returns `org` unchanged if
+    it has no ODS code."""
+    ods = client.organisation_ods_code(org) if org else None
+    return (client.organisation_by_ods(ods) if ods else None) or org
+
+
+def _org_name(org):
+    """An Organization's name for display/grouping, with an all-capitals
+    name (ODS convention, e.g. a server Organization backfilled by
+    scripts/fix_organization_names.py) title-cased the same way the ODS
+    trust list's names are, so two sources can't differ only by case."""
+    name = (org or {}).get("name")
+    return FhirClient._ods_name_case(name) if name and name.isupper() else name
+
+
 def _order_ordering(order):
     """(requesting Organization resource or None, requesting organisation
     name) for one ServiceRequest on the /stats screens — read off the
@@ -2167,8 +2214,8 @@ def _order_ordering(order):
     the requester reference (order_organisation_resource() — one GET per
     distinct requester, cached), so an order with a literal-only requester
     still gets a name."""
-    org = client.order_ordering_organisation(order) or client.order_organisation_resource(order)
-    name = (org.get("name") if org else None) or client.order_organisation(order) or "Unknown"
+    org = _canonical_org(client.order_ordering_organisation(order) or client.order_organisation_resource(order))
+    name = _org_name(org) or client.order_organisation(order) or "Unknown"
     return org, name
 
 
@@ -2185,9 +2232,9 @@ def _report_ordering(report, orders_index):
     itself (client.report_ordering_organisation()), falling back to the
     matched order's requesting organisation (_order_ordering())."""
     order = client.match_report_order(report, orders_index)
-    org = client.report_ordering_organisation(report)
+    org = _canonical_org(client.report_ordering_organisation(report))
     if org:
-        name = org.get("name") or "Unknown"
+        name = _org_name(org) or "Unknown"
     elif order:
         org, name = _order_ordering(order)
     else:
@@ -2266,8 +2313,9 @@ def stats():
     order_ics_map_html, order_ics_map_unmatched_count, order_ics_map_unmatched_names = None, 0, []
     report_map_points, report_map_unmapped_count = [], 0
     report_ics_map_html, report_ics_map_unmatched_count, report_ics_map_unmatched_names = None, 0, []
+    truncated = []
     try:
-        orders = client.orders_in_range(start, end)
+        orders, reports, truncated = _stats_fetch(start, end)
         order_rows = []
         order_orgs = []
         for o in orders:
@@ -2288,7 +2336,6 @@ def stats():
 
         order_ics_map_html, order_ics_map_unmatched_count, order_ics_map_unmatched_names = ics_choropleth_html(group_count(order_rows, "ics"))
 
-        reports = client.reports_in_range(start, end)
         orders_index = _orders_index_for_reports(reports, orders)
         report_rows = []
         report_orgs = []
@@ -2318,7 +2365,7 @@ def stats():
         error = str(e)
 
     return render_template(
-        "stats.html", start=start, end=end, error=error,
+        "stats.html", start=start, end=end, error=error, truncated=truncated, max_pages=STATS_MAX_PAGES,
         order_count=len(order_rows), report_count=len(report_rows),
         order_by_org=group_count(order_rows, "organisation"),
         order_by_indication=group_count(order_rows, "indication"),
@@ -2380,9 +2427,9 @@ def stats_organisation():
     error = None
     rows = []
     order_by_test, report_by_test = [], []
+    truncated = []
     try:
-        orders = client.orders_in_range(start, end)
-        reports = client.reports_in_range(start, end)
+        orders, reports, truncated = _stats_fetch(start, end)
 
         orders_index = _orders_index_for_reports(reports, orders)
         report_by_order_id = _reports_by_order_id(reports, orders_index)
@@ -2423,6 +2470,7 @@ def stats_organisation():
 
     return render_template(
         "stats_organisation.html", org=org, start=start, end=end, error=error,
+        truncated=truncated, max_pages=STATS_MAX_PAGES,
         rows=rows, order_by_test=order_by_test, report_by_test=report_by_test,
         show_requester_code=(org == "Unknown"),
     )
@@ -2453,9 +2501,9 @@ def stats_ics():
     error = None
     rows = []
     order_by_test, report_by_test = [], []
+    truncated = []
     try:
-        orders = client.orders_in_range(start, end)
-        reports = client.reports_in_range(start, end)
+        orders, reports, truncated = _stats_fetch(start, end)
 
         orders_index = _orders_index_for_reports(reports, orders)
         report_by_order_id = _reports_by_order_id(reports, orders_index)
@@ -2491,6 +2539,7 @@ def stats_ics():
 
     return render_template(
         "stats_ics.html", ics=ics, start=start, end=end, error=error,
+        truncated=truncated, max_pages=STATS_MAX_PAGES,
         rows=rows, order_by_test=order_by_test, report_by_test=report_by_test,
     )
 
@@ -2525,9 +2574,12 @@ MONTHLY_REPORTS_WINDOW_DAYS = 7
 MONTHLY_REPORTS_MAX_PAGES = 100
 
 
-@app.route("/stats/monthly-reports")
-def monthly_reports():
+def _build_monthly_report():
     """
+    Everything the monthly report shows, as the template context dict —
+    shared by monthly_reports() (HTML) and monthly_reports_pdf(), so the
+    two can never disagree. Reads the same query params either way.
+
     Genomic test reports per calendar month (default: the last full month
     only; the current month can be picked too, counted up to today), by ICS and report category, filterable by NHS region and
     category, with each ICS expandable into its NHS trusts.
@@ -2601,7 +2653,7 @@ def monthly_reports():
                 ics = geo["icb_name"] if geo else "Unknown"
                 if geo:
                     ics_region_names[ics] = geo["region_name"]
-                trust_name = org.get("name") if org else None
+                trust_name = _org_name(org)
                 trust = _org_display_name(trust_name or ordering_ods, ordering_ods) if (trust_name or ordering_ods) else "Unknown"
                 category = FhirClient.report_category(r.get("code"), order.get("code") if order else None)
                 by_cat = ics_counts.setdefault(ics, {}).setdefault(month, {})
@@ -2637,6 +2689,18 @@ def monthly_reports():
     if not icbs_by_region and not error:
         error = "Couldn't download the NHS ODS trust list, so ICS couldn't be worked out — showing only ICSs with data."
 
+    def category_breakdown(month_cats):
+        """Category x month rows for one ICS or trust — the "Categories"
+        popup. Always every category (the category filter doesn't apply:
+        this *is* the breakdown); categories with no reports are left
+        out."""
+        rows = []
+        for key, label in FhirClient.REPORT_CATEGORIES:
+            cat_months = [month_cats.get(mo, {}).get(key, 0) for mo in months]
+            if sum(cat_months):
+                rows.append({"label": label, "months": cat_months, "total": sum(cat_months)})
+        return rows
+
     ics_rows = []
     for ics in ics_list:
         month_cats = ics_counts.get(ics, {})
@@ -2644,12 +2708,14 @@ def monthly_reports():
         for trust, trust_month_cats in sorted(trust_counts.get(ics, {}).items()):
             trust_months = [count(trust_month_cats, mo) for mo in months]
             if sum(trust_months):
-                trusts.append({"name": trust, "months": trust_months, "total": sum(trust_months)})
+                trusts.append({"name": trust, "months": trust_months, "total": sum(trust_months),
+                               "categories": category_breakdown(trust_month_cats)})
         trusts.sort(key=lambda t: -t["total"])
         ics_months = [count(month_cats, mo) for mo in months]
         ics_rows.append({
             "name": ics, "label": short_icb_name(ics), "region": ics_region_names.get(ics) or "—",
             "months": ics_months, "total": sum(ics_months), "trusts": trusts,
+            "categories": category_breakdown(month_cats),
         })
 
     month_totals = [sum(r["months"][i] for r in ics_rows) for i in range(len(months))]
@@ -2665,14 +2731,62 @@ def monthly_reports():
         if key != "unclassified" or sum(cat_months):
             category_rows.append({"key": key, "label": label, "months": cat_months, "total": sum(cat_months)})
 
-    return render_template(
-        "monthly_reports.html", error=error,
+    return dict(
+        error=error,
         start_month=start_month, end_month=end_month, months=months,
         regions=regions, selected_region=selected_region,
         categories=FhirClient.REPORT_CATEGORIES, selected_category=selected_category,
         selected_category_label=category_labels.get(selected_category),
         ics_rows=ics_rows, month_totals=month_totals, category_rows=category_rows,
+        category_month_totals=[sum(r["months"][i] for r in category_rows) for i in range(len(months))],
         truncated_months=truncated_months, max_pages=MONTHLY_REPORTS_MAX_PAGES,
+    )
+
+
+#: The last monthly report each login built, keyed by (session id, query
+#: string), so "Download as PDF" straight after viewing the page doesn't
+#: re-run every search. Kept MONTHLY_REPORT_CACHE_SECONDS; same
+#: in-process dict approach as _session_clients/_order_load_cache.
+_monthly_report_cache = {}
+MONTHLY_REPORT_CACHE_SECONDS = 600
+
+
+def _monthly_report_context():
+    """_build_monthly_report() for the current request, reusing this
+    login's result for the same query string if it's still fresh."""
+    key = (session.get("sid"), tuple(sorted(request.args.items(multi=True))))
+    now = time.time()
+    for k in [k for k, (built, _) in _monthly_report_cache.items() if now - built > MONTHLY_REPORT_CACHE_SECONDS]:
+        _monthly_report_cache.pop(k, None)
+    cached = _monthly_report_cache.get(key)
+    if cached:
+        return cached[1]
+    context = _build_monthly_report()
+    _monthly_report_cache[key] = (now, context)
+    return context
+
+
+@app.route("/stats/monthly-reports")
+def monthly_reports():
+    """The monthly report page — see _build_monthly_report()."""
+    return render_template("monthly_reports.html", **_monthly_report_context())
+
+
+@app.route("/stats/monthly-reports/pdf")
+def monthly_reports_pdf():
+    """The monthly report as a PDF download — the same data as the page
+    for the same query string (the page's "Download as PDF" link carries
+    it), via pdf_report.monthly_report_pdf_bytes(). Since the PDF can't
+    expand rows or open popups, it lists every ICS's trusts and each
+    ICS's category breakdown in full."""
+    context = _monthly_report_context()
+    pdf_bytes = monthly_report_pdf_bytes(context)
+    months = context.get("months") or []
+    span = f"{months[0]}-to-{months[-1]}" if months else "report"
+    filename = f"monthly-reports-{span}.pdf"
+    return Response(
+        pdf_bytes, mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

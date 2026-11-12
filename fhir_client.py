@@ -1382,7 +1382,7 @@ class FhirClient:
 
     # ---- Stats: system-wide date-range queries -------------------------
 
-    def orders_in_range(self, start_date, end_date):
+    def orders_in_range(self, start_date, end_date, max_pages=10):
         """All genomic test orders authored within [start_date, end_date]
         (ISO dates), across all patients — used by the daily stats screen.
 
@@ -1404,11 +1404,11 @@ class FhirClient:
         }
         try:
             matches, included = self._search_all_split(
-                "ServiceRequest", {**params, "category": SERVICE_REQUEST_CATEGORY})
+                "ServiceRequest", {**params, "category": SERVICE_REQUEST_CATEGORY}, max_pages=max_pages)
         except requests.HTTPError:
             matches, included = [], []
         if not matches:
-            matches, included = self._search_all_split("ServiceRequest", params)
+            matches, included = self._search_all_split("ServiceRequest", params, max_pages=max_pages)
         self._cache_included(included)
         return matches
 
@@ -1945,7 +1945,8 @@ class FhirClient:
         titled = re.sub(r"\b(Nhs|Gp|Icb|Uk)\b", lambda m: m.group(0).upper(), titled)
         # "Cheshire and Merseyside", "Cornwall and the Isles of Scilly" —
         # small words lower case except as the first word.
-        return re.sub(r"(?<=\s)(And|Of|The|On|In|For|At|By|Upon)\b", lambda m: m.group(0).lower(), titled)
+        # ...and after a hyphen too ("Stoke-on-Trent").
+        return re.sub(r"(?<=[\s-])(And|Of|The|On|In|For|At|By|Upon)\b", lambda m: m.group(0).lower(), titled)
 
     def order_ordering_ods(self, order):
         """The requesting organisation's ODS code, read from the
@@ -4406,6 +4407,15 @@ class FhirClient:
     #: National Genomic Test Directory).
     NW_TEST_CODE_SYSTEM = "https://fhir.nwgenomics.nhs.uk/CodeSystem/NWTestCode"
 
+    #: LOINC report codes mapped straight to a REPORT_CATEGORIES key — for
+    #: reports coded in LOINC rather than (or as well as) a test code.
+    #: Only consulted when the same CodeableConcept carries no recognised
+    #: test code (see report_category()). Add codes as they're seen.
+    LOINC_SYSTEM = "http://loinc.org"
+    LOINC_REPORT_CATEGORIES = {
+        "33893-9": "cytogenomic",  # Karyotype [Identifier] in Bone marrow
+    }
+
     # Inferred from the Test Directory's own display text — there's no
     # published category per code. Checked in REPORT_CATEGORY_RULES order
     # below; the first match wins.
@@ -4445,7 +4455,11 @@ class FhirClient:
         then cytogenomic techniques (karyotype, microarray, FISH, common
         aneuploidy — germline *or* cancer), then any remaining M/MX/HX
         code is somatic cancer and any remaining R/RX code is variant
-        reporting. For M codes, bracketed text is ignored when matching
+        reporting. A CodeableConcept with no recognised test code can still
+        be categorised by a LOINC code in LOINC_REPORT_CATEGORIES (e.g.
+        33893-9, bone marrow karyotype -> cytogenomic) — checked per
+        CodeableConcept, so a report's own LOINC code beats its order's
+        test code. For M codes, bracketed text is ignored when matching
         technique keywords — those brackets list gene/variant detail
         ("...structural variant (To include ... Monosomal karyotype)"),
         not the test's own technique, unlike an R code's trailing
@@ -4453,6 +4467,9 @@ class FhirClient:
         for cc in codeable_concepts:
             code, display, system = cls._test_code_and_display(cc)
             if not code:
+                for coding in (cc or {}).get("coding", []):
+                    if coding.get("system") == cls.LOINC_SYSTEM and coding.get("code") in cls.LOINC_REPORT_CATEGORIES:
+                        return cls.LOINC_REPORT_CATEGORIES[coding["code"]]
                 continue
             if system == cls.HISTOTRAC_TEST_CODE_SYSTEM:
                 return "hi"

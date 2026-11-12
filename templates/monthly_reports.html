@@ -8,6 +8,10 @@
     categories are inferred from each report's test code (falling back to
     its originating order's). Click an ICS to show its NHS trusts.
   </p>
+  <p class="muted">
+    <strong>Coverage:</strong> reports from iGene and Shire only — StarLIMS
+    reports aren't included.
+  </p>
 
   <form action="{{ request.script_root }}/stats/monthly-reports" method="get">
     <p>
@@ -28,6 +32,9 @@
         {% endfor %}
       </select>
       <button type="submit">Update</button>
+      {% if months %}
+        &nbsp; <a href="{{ request.script_root }}/stats/monthly-reports/pdf?{{ request.query_string.decode() }}">Download as PDF</a>
+      {% endif %}
     </p>
   </form>
 
@@ -54,6 +61,11 @@
             <td><strong>{{ row.total }}</strong></td>
           </tr>
         {% endfor %}
+        <tr>
+          <th>Total</th>
+          {% for n in category_month_totals %}<th>{{ n }}</th>{% endfor %}
+          <th>{{ category_month_totals|sum }}</th>
+        </tr>
       </table>
     </div>
 
@@ -73,6 +85,10 @@
               {% else %}
                 {{ row.label }}
               {% endif %}
+              {% if row.categories %}
+                <button type="button" class="category-btn" data-title="{{ row.name }}"
+                        data-breakdown='{{ row.categories|tojson }}' onclick="showCategories(this)">Categories</button>
+              {% endif %}
             </td>
             {% if not selected_region %}<td class="muted">{{ row.region }}</td>{% endif %}
             {% for n in row.months %}<td>{{ n }}</td>{% endfor %}
@@ -81,7 +97,11 @@
           {% set ics_index = loop.index %}
           {% for t in row.trusts %}
             <tr class="trust-row" data-ics="{{ ics_index }}" hidden style="background: #fafbfd;">
-              <td style="padding-left: 28px;">{{ t.name }}</td>
+              <td style="padding-left: 28px;">
+                {{ t.name }}
+                <button type="button" class="category-btn" data-title="{{ t.name }} — {{ row.label }}"
+                        data-breakdown='{{ t.categories|tojson }}' onclick="showCategories(this)">Categories</button>
+              </td>
               {% if not selected_region %}<td></td>{% endif %}
               {% for n in t.months %}<td>{{ n }}</td>{% endfor %}
               <td>{{ t.total }}</td>
@@ -98,7 +118,49 @@
     </div>
   {% endif %}
 
+  <!-- "Categories" popup — one ICS's or trust's reports by category and
+       month. Native <dialog>, same approach as base.html's View FHIR
+       dialog; the breakdown rides on each button's data-breakdown
+       (tojson-escaped, so safe inside the single-quoted attribute). -->
+  <style>
+    .category-btn { margin-left: 6px; padding: 1px 7px; font-size: .75rem; }
+  </style>
+  <dialog id="category-dialog" style="width: min(820px, 92vw); max-height: 82vh; border: 1px solid #ccc; border-radius: 6px; padding: 0; overscroll-behavior: contain;">
+    <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid #eee;">
+      <strong id="category-dialog-title"></strong>
+      <button type="button" onclick="document.getElementById('category-dialog').close()">Close</button>
+    </div>
+    <div style="padding: 4px 14px 12px; overflow: auto; max-height: calc(82vh - 60px); overscroll-behavior: contain;">
+      <table id="category-dialog-table"></table>
+    </div>
+  </dialog>
+
   <script>
+    var categoryMonths = {{ months|tojson }};
+
+    function showCategories(button) {
+      var rows = JSON.parse(button.dataset.breakdown);
+      var table = document.getElementById('category-dialog-table');
+      table.textContent = '';
+      var head = table.insertRow();
+      ['Category'].concat(categoryMonths, ['Total']).forEach(function (text) {
+        var th = document.createElement('th'); th.textContent = text; head.appendChild(th);
+      });
+      var totals = categoryMonths.map(function () { return 0; });
+      rows.forEach(function (row) {
+        var tr = table.insertRow();
+        tr.insertCell().textContent = row.label;
+        row.months.forEach(function (n, i) { tr.insertCell().textContent = n; totals[i] += n; });
+        var total = tr.insertCell(); total.innerHTML = '<strong></strong>'; total.firstChild.textContent = row.total;
+      });
+      var foot = table.insertRow();
+      ['Total'].concat(totals, [totals.reduce(function (a, b) { return a + b; }, 0)]).forEach(function (text) {
+        var th = document.createElement('th'); th.textContent = text; foot.appendChild(th);
+      });
+      document.getElementById('category-dialog-title').textContent = button.dataset.title;
+      document.getElementById('category-dialog').showModal();
+    }
+
     function toggleTrusts(link) {
       var rows = document.querySelectorAll('tr.trust-row[data-ics="' + link.dataset.ics + '"]');
       var show = rows.length && rows[0].hidden;
