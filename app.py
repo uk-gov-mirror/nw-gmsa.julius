@@ -2748,11 +2748,39 @@ def _build_monthly_report():
     except Exception as e:
         error = str(e)
 
+    selected_leaf_keys = FhirClient.category_leaf_keys(selected_category) if selected_category else None
+
     def count(month_cats, month):
         cats = month_cats.get(month, {})
-        if selected_category:
-            return cats.get(selected_category, 0)
+        if selected_leaf_keys:
+            return sum(cats.get(k, 0) for k in selected_leaf_keys)
         return sum(cats.values())
+
+    def category_tree_rows(leaf_months, keep_empty):
+        """Category x month rows in REPORT_CATEGORY_TREE order — a row per
+        category, followed by its sub-category rows (`child: True`); a
+        parent's months are its children's sums. `leaf_months(key)` gives
+        one leaf key's per-month counts. Only top-level rows should be
+        summed for a total. `keep_empty`: also list categories with no
+        reports (except No test performed/Unclassified, which only show
+        when they have some)."""
+        rows = []
+        for key, label, children in FhirClient.REPORT_CATEGORY_TREE:
+            child_rows = [
+                {"key": ck, "label": cl, "months": leaf_months(ck), "child": True}
+                for ck, cl in children
+            ]
+            months_ = ([sum(c["months"][i] for c in child_rows) for i in range(len(months))]
+                       if child_rows else leaf_months(key))
+            total = sum(months_)
+            if not total and (not keep_empty or key in ("unclassified", "no_test")):
+                continue
+            rows.append({"key": key, "label": label, "months": months_, "total": total, "child": False})
+            for c in child_rows:
+                c["total"] = sum(c["months"])
+                if c["total"] or keep_empty:
+                    rows.append(c)
+        return rows
 
     # Every current ICB in the selected region (or all regions) is listed,
     # zero-filled, so a region view shows its whole ICS list — from ODS's
@@ -2777,14 +2805,10 @@ def _build_monthly_report():
     def category_breakdown(month_cats):
         """Category x month rows for one ICS or trust — the "Categories"
         popup. Always every category (the category filter doesn't apply:
-        this *is* the breakdown); categories with no reports are left
-        out."""
-        rows = []
-        for key, label in FhirClient.REPORT_CATEGORIES:
-            cat_months = [month_cats.get(mo, {}).get(key, 0) for mo in months]
-            if sum(cat_months):
-                rows.append({"label": label, "months": cat_months, "total": sum(cat_months)})
-        return rows
+        this *is* the breakdown); categories and sub-categories with no
+        reports are left out."""
+        return category_tree_rows(
+            lambda key: [month_cats.get(mo, {}).get(key, 0) for mo in months], keep_empty=False)
 
     ics_rows = []
     for ics in ics_list:
@@ -2824,14 +2848,9 @@ def _build_monthly_report():
 
     # Category x month for the ICS list above (region filter applied,
     # category filter not — this table *is* the category breakdown).
-    category_rows = []
-    for key, label in FhirClient.REPORT_CATEGORIES:
-        cat_months = [
-            sum(ics_counts.get(ics, {}).get(mo, {}).get(key, 0) for ics in ics_list)
-            for mo in months
-        ]
-        if key not in ("unclassified", "no_test") or sum(cat_months):
-            category_rows.append({"key": key, "label": label, "months": cat_months, "total": sum(cat_months)})
+    category_rows = category_tree_rows(
+        lambda key: [sum(ics_counts.get(ics, {}).get(mo, {}).get(key, 0) for ics in ics_list) for mo in months],
+        keep_empty=True)
 
     return dict(
         error=error,
@@ -2840,7 +2859,7 @@ def _build_monthly_report():
         categories=FhirClient.REPORT_CATEGORIES, selected_category=selected_category,
         selected_category_label=category_labels.get(selected_category),
         ics_rows=ics_rows, month_totals=month_totals, category_rows=category_rows,
-        category_month_totals=[sum(r["months"][i] for r in category_rows) for i in range(len(months))],
+        category_month_totals=[sum(r["months"][i] for r in category_rows if not r["child"]) for i in range(len(months))],
         truncated_months=truncated_months, max_pages=MONTHLY_REPORTS_MAX_PAGES,
         unclassified_signatures=unclassified_signatures, unclassified_total=sum(unclassified_signatures.values()),
         unclassified_shown=UNCLASSIFIED_SIGNATURES_SHOWN, delivery=delivery,

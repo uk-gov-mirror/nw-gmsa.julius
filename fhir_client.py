@@ -4385,21 +4385,52 @@ class FhirClient:
 
     # ---- Monthly reports: report category from the test code ----------
 
-    #: The monthly reports screen's report categories, in display order
-    #: (keys are what report_category() returns). Modelled on HL7
+    #: The monthly reports screen's report categories, in display order:
+    #: (key, label, [(sub-category key, label), ...]). Modelled on HL7
     #: Genomics Reporting's report types, plus "Variant reporting" for the
-    #: remaining germline (R-code) tests that fit none of the others.
-    REPORT_CATEGORIES = [
-        ("pharmacogenomics", "Pharmacogenomics"),
-        ("wgs", "Whole Genomic Sequencing"),
-        ("cancer_wgs", "Cancer Whole Genomic Sequencing"),
-        ("somatic", "Somatic Cancer"),
-        ("hi", "Histocompatibility and Immunogenetic Reporting"),
-        ("cytogenomic", "Cytogenomic Reporting"),
-        ("variant", "Variant reporting"),
-        ("no_test", "No test performed (storage / not processed)"),
-        ("unclassified", "Unclassified"),
+    #: remaining germline (R-code) tests, MRD monitoring and ctDNA as
+    #: their own workstreams. report_category() returns a *leaf* key — a
+    #: sub-category key where a category has them (e.g. "somatic_haem"),
+    #: else the category's own key; a parent's count is its children's sum.
+    REPORT_CATEGORY_TREE = [
+        ("pharmacogenomics", "Pharmacogenomics", []),
+        ("wgs", "Whole Genomic Sequencing", []),
+        ("cancer_wgs", "Cancer Whole Genomic Sequencing", []),
+        ("somatic", "Somatic Cancer", [
+            ("somatic_haem", "Haemato-oncology"),
+            ("somatic_solid", "Solid tumour"),
+        ]),
+        ("mrd", "MRD monitoring", []),
+        ("ctdna", "ctDNA (circulating tumour DNA)", []),
+        ("hi", "Histocompatibility and Immunogenetic Reporting", []),
+        ("cytogenomic", "Cytogenomic Reporting", [
+            ("cyto_prenatal", "Prenatal"),
+            ("cyto_postnatal", "Postnatal (constitutional)"),
+            ("cyto_cancer", "Cancer"),
+        ]),
+        ("variant", "Variant reporting", [
+            ("variant_rare", "Rare disease"),
+            ("variant_cancer", "Inherited cancer"),
+        ]),
+        ("no_test", "No test performed (storage / not processed)", []),
+        ("unclassified", "Unclassified", []),
     ]
+    #: Every category and sub-category as (key, full label), in display
+    #: order — sub-categories labelled "Parent — Child".
+    REPORT_CATEGORIES = [
+        item for key, label, children in REPORT_CATEGORY_TREE
+        for item in [(key, label)] + [(ck, f"{label} — {cl}") for ck, cl in children]
+    ]
+
+    @classmethod
+    def category_leaf_keys(cls, key):
+        """The leaf keys report_category() can return that count towards
+        `key` — its sub-categories for a parent category, else just
+        itself."""
+        for k, _, children in cls.REPORT_CATEGORY_TREE:
+            if k == key and children:
+                return [ck for ck, _ in children]
+        return [key]
 
     #: Histotrac (the H&I lab system) test codes — anything coded in this
     #: system is H&I reporting, whatever the code.
@@ -4436,7 +4467,7 @@ class FhirClient:
     #: test code (see report_category()). Add codes as they're seen.
     LOINC_SYSTEM = "http://loinc.org"
     LOINC_REPORT_CATEGORIES = {
-        "33893-9": "cytogenomic",  # Karyotype [Identifier] in Bone marrow
+        "33893-9": "cyto_cancer",  # Karyotype [Identifier] in Bone marrow
     }
 
     # Inferred from the Test Directory's own display text — there's no
@@ -4447,6 +4478,44 @@ class FhirClient:
     _PGX_CODE_PREFIXES = ("R454.", "RX06.", "RX07.")  # mavacamten CYP2C19, IPTIP, TPMT
     _PGX_TEXT = re.compile(r"\bDPYD\b|\bTPMT\b|\bNUDT15\b|\bUGT1A1\b|\bCYP2[A-Z]\d|pharmaco", re.I)
     _WGS_TEXT = re.compile(r"\bWGS\b|whole genome", re.I)
+    #: ctDNA / liquid biopsy tests — in the Test Directory M3.13, M4.5,
+    #: M4.14, M226.7, and NW local MX13.1, MX14.1. Checked before WGS,
+    #: cytogenomic and somatic, so these come out of Somatic Cancer.
+    _CTDNA_TEXT = re.compile(r"\bctDNA\b|\bcfDNA\b|circulating tumou?r DNA|cell-free DNA|liquid biopsy", re.I)
+    #: MRD (measurable/minimal residual disease) monitoring — every such
+    #: Test Directory test has "MRD" in its name (M80/M84/M89/M91: AML,
+    #: CML, other acute leukaemia, ALL), plus iGene's BCR::ABL1 and NPM1
+    #: quantitative RT-PCR tests.
+    _MRD_TEXT = re.compile(r"\bMRD\b|minimal residual|measurable residual|RT-PCR[- ]?QUAN|Quantitative - (BCR|NPM1)", re.I)
+    #: Haemato-oncology indications — M80-M117 (leukaemias, lymphomas,
+    #: myeloma, MPN/MDS, mastocytosis, histiocytosis) plus the later
+    #: M181 (hairy cell leukaemia), M182 (ALK+ ALCL), M224 (MDS/MPN),
+    #: M225 (suspected lymphoma), M235 (haematological tumours exhausted
+    #: all standard of care). Every other M indication is a solid tumour.
+    _HAEM_ONC_INDICATIONS = set(range(80, 118)) | {181, 182, 224, 225, 235}
+    #: Haemato-oncology wording, for codes with no M indication number
+    #: (NW local MX/HX codes, iGene IGEAP panels).
+    _HAEM_ONC_TEXT = re.compile(
+        r"leukaemia|leukemia|lymphoma|myeloma|myelo|\bMPN\b|\bMDS\b|PanHaem|haemato|haematological|"
+        r"mastocytosis|plasma cell|histiocytosis|\bAML\b|\bCML\b|\bCLL\b|\bALL\b", re.I)
+    #: Inherited cancer predisposition R indications (the Test Directory's
+    #: germline cancer tests) — everything else in R is rare disease.
+    _INHERITED_CANCER_INDICATIONS = {
+        207, 208, 210, 211, 213, 214, 215, 216, 217, 218, 219, 221, 222, 223, 224, 225, 226, 228, 230,
+        254, 347, 363, 364, 365, 366, 367, 376, 404, 414, 422, 423, 424, 430, 444, 456,
+    }
+    #: Inherited cancer wording, for RX codes and IGEAP tests with no R
+    #: indication number (e.g. "Predictive testing - Inherited Cancer").
+    _INHERITED_CANCER_TEXT = re.compile(r"\bcancer\b|BRCA|tumou?r predisposition|Lynch|polyposis", re.I)
+    #: Prenatal cytogenomic tests (R codes) — fetal / prenatal / pregnancy loss.
+    _PRENATAL_TEXT = re.compile(r"fetal|fetus|prenatal|products of conception|miscarriage|pregnan", re.I)
+
+    @staticmethod
+    def _indication_number(code):
+        """The number in a test code's indication ("M80.14" -> 80,
+        "R208" -> 208), or None for codes without one (MX/HX/RX)."""
+        m = re.match(r"[RM](\d+)", code or "")
+        return int(m.group(1)) if m else None
     _CYTOGENOMIC_TEXT = re.compile(r"karyotyp|microarray|\bFISH\b|aneuploidy|chromosom|cytogen", re.I)
 
     @classmethod
@@ -4473,12 +4542,17 @@ class FhirClient:
 
         The rules are inferred, not published: H&I (Histotrac codes,
         HSCT chimerism, passenger lymphocyte syndrome, HLA), then
-        pharmacogenomics (DPYD/TPMT/NUDT15/CYP2xx, mavacamten), then WGS
-        (split into cancer WGS for M/MX/HX codes, else rare disease WGS),
-        then cytogenomic techniques (karyotype, microarray, FISH, common
-        aneuploidy — germline *or* cancer), then any remaining M/MX/HX
-        code is somatic cancer and any remaining R/RX code is variant
-        reporting.
+        pharmacogenomics (DPYD/TPMT/NUDT15/CYP2xx, mavacamten), then ctDNA
+        (ctDNA/cfDNA/circulating tumour DNA in the display), then MRD
+        monitoring (M codes with "MRD" in the name), then WGS (split into
+        cancer WGS for M/MX/HX codes, else rare disease WGS), then
+        cytogenomic techniques (karyotype, microarray, FISH, common
+        aneuploidy) as cancer (M codes), prenatal or postnatal, then any
+        remaining M/MX/HX code is somatic cancer — haemato-oncology
+        (_HAEM_ONC_INDICATIONS) or solid tumour — and any remaining R/RX
+        code is variant reporting — inherited cancer
+        (_INHERITED_CANCER_INDICATIONS) or rare disease. Returns a leaf
+        key of REPORT_CATEGORY_TREE.
 
         Precedence across all the CodeableConcepts: any recognised test
         code (Test Directory / NW local / Histotrac — report's first, then
@@ -4528,14 +4602,26 @@ class FhirClient:
             return "hi"
         if code.startswith(cls._PGX_CODE_PREFIXES) or cls._PGX_TEXT.search(text):
             return "pharmacogenomics"
+        if cls._CTDNA_TEXT.search(text):
+            return "ctdna"
+        cancer = code.startswith(("M", "HX"))
+        if cancer and cls._MRD_TEXT.search(text):
+            return "mrd"
         if cls._WGS_TEXT.search(text):
-            return "cancer_wgs" if code.startswith(("M", "HX")) else "wgs"
+            return "cancer_wgs" if cancer else "wgs"
         if cls._CYTOGENOMIC_TEXT.search(text):
-            return "cytogenomic"
-        if code.startswith(("M", "HX")):
-            return "somatic"
+            if cancer:
+                return "cyto_cancer"
+            return "cyto_prenatal" if cls._PRENATAL_TEXT.search(text) else "cyto_postnatal"
+        number = cls._indication_number(code)
+        if cancer:
+            haem = (number in cls._HAEM_ONC_INDICATIONS) if number is not None \
+                else (code.startswith("HX") or bool(cls._HAEM_ONC_TEXT.search(text)))
+            return "somatic_haem" if haem else "somatic_solid"
         if code.startswith("R"):
-            return "variant"
+            inherited = (number in cls._INHERITED_CANCER_INDICATIONS) if number is not None \
+                else bool(cls._INHERITED_CANCER_TEXT.search(text))
+            return "variant_cancer" if inherited else "variant_rare"
         return None
 
     @classmethod
@@ -4552,10 +4638,12 @@ class FhirClient:
         3. An indication code in the panel code ("M4_LUNG_GX",
            "v2bM215_ENDO_POLE_PS", "CCP19v1_R131v5") -> categorised as an
            M (cancer) or R (germline) code, with the IGEAP display as text.
-        4. The usual technique rules on the text (H&I, PGx, WGS,
-           cytogenomic — e.g. "SNP Microarray"), then haem-onc/solid tumour
-           keywords (BCR::ABL1, NPM1, MRD, PanHaem, fusion) -> somatic, then
-           Sanger predictive / family follow-up -> variant reporting.
+        4. The usual technique rules on the text (H&I, PGx, ctDNA, MRD —
+           e.g. BCR::ABL1/NPM1 quantitative RT-PCR — WGS, cytogenomic —
+           e.g. "SNP Microarray"), then haem-onc/solid tumour keywords
+           (PanHaem, MPN, myeloid, fusion) -> somatic (haem or solid by
+           wording), then Sanger predictive / family follow-up -> variant
+           reporting (inherited cancer if it says cancer, else rare disease).
         """
         text = f"{code} {display}"
         if cls._IGEAP_NO_TEST.search(text):
@@ -4573,14 +4661,18 @@ class FhirClient:
             return "hi"
         if cls._PGX_TEXT.search(text):
             return "pharmacogenomics"
+        if cls._CTDNA_TEXT.search(text):
+            return "ctdna"
+        if cls._MRD_TEXT.search(text):
+            return "mrd"
         if cls._WGS_TEXT.search(text):
             return "wgs"
         if cls._CYTOGENOMIC_TEXT.search(text):
-            return "cytogenomic"
+            return "cyto_prenatal" if cls._PRENATAL_TEXT.search(text) else "cyto_postnatal"
         if cls._IGEAP_SOMATIC.search(text):
-            return "somatic"
+            return "somatic_haem" if cls._HAEM_ONC_TEXT.search(text) else "somatic_solid"
         if cls._IGEAP_VARIANT.search(text):
-            return "variant"
+            return "variant_cancer" if cls._INHERITED_CANCER_TEXT.search(text) else "variant_rare"
         return None
 
     #: This IG's own CodeSystem for clinical indications — confirmed by

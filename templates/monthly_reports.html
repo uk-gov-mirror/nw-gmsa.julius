@@ -55,11 +55,19 @@
       <table>
         <tr><th>Category</th>{% for m in months %}<th>{{ m }}</th>{% endfor %}<th>Total</th></tr>
         {% for row in category_rows %}
-          <tr>
-            <td>{{ row.label }}</td>
-            {% for n in row.months %}<td>{{ n }}</td>{% endfor %}
-            <td><strong>{{ row.total }}</strong></td>
-          </tr>
+          {% if row.child %}
+            <tr style="background: #fafbfd;" class="muted">
+              <td style="padding-left: 28px;">{{ row.label }}</td>
+              {% for n in row.months %}<td>{{ n }}</td>{% endfor %}
+              <td>{{ row.total }}</td>
+            </tr>
+          {% else %}
+            <tr>
+              <td>{{ row.label }}</td>
+              {% for n in row.months %}<td>{{ n }}</td>{% endfor %}
+              <td><strong>{{ row.total }}</strong></td>
+            </tr>
+          {% endif %}
         {% endfor %}
         <tr>
           <th>Total</th>
@@ -204,10 +212,16 @@
       });
       var totals = categoryMonths.map(function () { return 0; });
       rows.forEach(function (row) {
+        // Sub-category rows are indented and not added to the totals —
+        // their parent row already counts them.
         var tr = table.insertRow();
-        tr.insertCell().textContent = row.label;
-        row.months.forEach(function (n, i) { tr.insertCell().textContent = n; totals[i] += n; });
-        var total = tr.insertCell(); total.innerHTML = '<strong></strong>'; total.firstChild.textContent = row.total;
+        var label = tr.insertCell();
+        label.textContent = row.label;
+        if (row.child) { label.style.paddingLeft = '28px'; tr.style.background = '#fafbfd'; tr.className = 'muted'; }
+        row.months.forEach(function (n, i) { tr.insertCell().textContent = n; if (!row.child) totals[i] += n; });
+        var total = tr.insertCell();
+        if (row.child) { total.textContent = row.total; }
+        else { total.innerHTML = '<strong></strong>'; total.firstChild.textContent = row.total; }
       });
       var foot = table.insertRow();
       ['Total'].concat(totals, [totals.reduce(function (a, b) { return a + b; }, 0)]).forEach(function (text) {

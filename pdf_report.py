@@ -206,11 +206,26 @@ def _name_cell(text, indent=0):
     return Paragraph(escape(text or "—"), style)
 
 
+def _category_body(rows):
+    """Category table body rows (+ the indexes of sub-category rows, for
+    _count_table()'s indented styling) and the top-level-only per-month
+    totals — sub-categories are already counted in their parent row."""
+    body, child_rows = [], []
+    for r in rows:
+        if r.get("child"):
+            child_rows.append(len(body))
+        body.append([_name_cell(r["label"], indent=10 if r.get("child") else 0)] + r["months"] + [r["total"]])
+    n_months = len(rows[0]["months"]) if rows else 0
+    totals = [sum(r["months"][i] for r in rows if not r.get("child")) for i in range(n_months)]
+    return body, child_rows, totals
+
+
 def _count_table(header, body_rows, total_row, name_width, extra_widths=(), trust_rows=()):
     """A name + counts table (name column, any `extra_widths` columns,
     then one column per month plus Total) with a bold total row. Months
     share whatever width is left. `trust_rows` are body row indexes
-    (0-based, header excluded) drawn as indented, shaded sub-rows."""
+    (0-based, header excluded) drawn as shaded sub-rows (trusts under an
+    ICS, sub-categories under a category)."""
     n_counts = len(header) - 1 - len(extra_widths)
     count_width = max((_CONTENT_WIDTH - name_width - sum(extra_widths)) / max(n_counts, 1), 28)
     col_widths = [name_width, *extra_widths] + [count_width] * n_counts
@@ -270,20 +285,20 @@ def monthly_report_pdf_bytes(report):
     month_header = list(months) + ["Total"]
 
     story.append(_para(f"Reports by category{escape(' — ' + region) if region else ''}", "Heading2"))
-    category_rows = report.get("category_rows") or []
-    totals = report.get("category_month_totals") or [0] * len(months)
+    body, child_rows, totals = _category_body(report.get("category_rows") or [])
+    totals = totals or [0] * len(months)
     story.append(_count_table(
-        ["Category"] + month_header,
-        [[_name_cell(r["label"])] + r["months"] + [r["total"]] for r in category_rows],
-        ["Total"] + totals + [sum(totals)],
-        name_width=200,
+        ["Category"] + month_header, body, ["Total"] + totals + [sum(totals)],
+        name_width=200, trust_rows=child_rows,
     ))
 
     delivery = report.get("delivery")
     if delivery:
         suffix = (f" — {region}" if region else "") + (f" — {category_label}" if category_label else "")
-        story.append(_para(escape("Reports actually delivered" + suffix), "Heading2"))
-        story.append(_para("Reports whose ordering trust receives them electronically (live trusts are maintained by hand in app.py)."))
+        delivery_heading = [
+            _para(escape("Reports actually delivered" + suffix), "Heading2"),
+            _para("Reports whose ordering trust receives them electronically (live trusts are maintained by hand in app.py)."),
+        ]
         rows = [["Status", "Reports", "% of total", "Trusts"]]
         for st in delivery["statuses"]:
             trusts = ", ".join(st["trusts"]) if st["trusts"] else ("All other trusts" if st["label"] == "Not live" else "—")
@@ -294,7 +309,7 @@ def monthly_report_pdf_bytes(report):
             ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
             ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f0f0f0")),
         ]))
-        story.append(t)
+        story.append(KeepTogether(delivery_heading + [t]))
         if delivery["targets"]:
             story.append(Spacer(1, 8))
             story.append(_para(
@@ -334,16 +349,14 @@ def monthly_report_pdf_bytes(report):
         story.append(_para("Categories by ICS", "Heading2"))
         story.append(_para("Each ICS's reports by category (all categories, whatever the category filter)."))
         for row in breakdowns:
-            cat_totals = [sum(c["months"][i] for c in row["categories"]) for i in range(len(months))]
-            # Heading + table kept on one page — at most 8 short rows.
+            body, child_rows, cat_totals = _category_body(row["categories"])
+            # Heading + table kept on one page — a couple of dozen short rows at most.
             story.append(KeepTogether([
                 Spacer(1, 6),
                 _para(f"<b>{escape(row['name'])}</b>"),
                 _count_table(
-                    ["Category"] + month_header,
-                    [[_name_cell(c["label"])] + c["months"] + [c["total"]] for c in row["categories"]],
-                    ["Total"] + cat_totals + [sum(cat_totals)],
-                    name_width=200,
+                    ["Category"] + month_header, body, ["Total"] + cat_totals + [sum(cat_totals)],
+                    name_width=200, trust_rows=child_rows,
                 ),
             ]))
 

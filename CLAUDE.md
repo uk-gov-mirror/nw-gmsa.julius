@@ -1075,11 +1075,25 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   West and North London, Thames Valley, Surrey and Sussex, Essex, Central
   East, Norfolk and Suffolk; 36 ICBs after). Picking a region lists
   *every* current ICS in it, zero-filled.
+- **Categories have sub-categories** (`FhirClient.REPORT_CATEGORY_TREE`):
+  Somatic Cancer → Haemato-oncology / Solid tumour (M indication in
+  `_HAEM_ONC_INDICATIONS` = M80–M117 + M181/M182/M224/M225/M235, else
+  wording for MX/HX/IGEAP); Cytogenomic → Prenatal (fetal/prenatal/
+  miscarriage/NIPT wording) / Postnatal / Cancer (M codes); Variant
+  reporting → Rare disease / Inherited cancer (R indication in
+  `_INHERITED_CANCER_INDICATIONS`, else "cancer"/BRCA/Lynch wording); plus
+  new top-level **MRD monitoring** (M codes with "MRD" in the name, iGene
+  BCR::ABL1/NPM1 quantitative RT-PCR) and **ctDNA**. `report_category()`
+  returns a *leaf* key; parent rows are their children's sums, and only
+  top-level rows go into totals (page, popup JS and PDF all follow this).
+  The category filter accepts a parent (sums its leaves via
+  `category_leaf_keys()`) or a sub-category.
 - **Categories are inferred from the test code** —
   `FhirClient.report_category()` (the report's own `code`),
   rules documented in its docstring: H&I (Histotrac codes, M118/R428/M242,
   HLA/chimerism) → pharmacogenomics (DPYD/TPMT/NUDT15/CYP2xx, R454, RX06/
-  RX07) → WGS (M/MX/HX codes as "Cancer Whole Genomic Sequencing", the
+  RX07) → ctDNA (ctDNA/cfDNA in the display: M3.13, M4.5, M4.14, M226.7,
+  MX13.1, MX14.1 — its own category, out of Somatic Cancer) → WGS (M/MX/HX codes as "Cancer Whole Genomic Sequencing", the
   rest as "Whole Genomic Sequencing") → cytogenomic (karyotype/microarray/FISH/aneuploidy, germline
   *or* cancer) → remaining M/MX/HX = somatic cancer → remaining R/RX =
   variant reporting → else unclassified. A CodeableConcept with no
