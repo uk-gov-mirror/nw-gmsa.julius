@@ -2594,6 +2594,59 @@ def _code_signature(codeable_concept, missing):
     return f"text only: {cc['text']}" if cc.get("text") else missing
 
 
+#: Which trusts' reports are *actually delivered* to them electronically,
+#: by ODS code — "live" (delivered today) or "nearing" (nearing go-live).
+#: Not derivable from the FHIR data, so maintained here by hand: update it
+#: as trusts go live. Every other trust counts as not delivered.
+TRUST_DELIVERY_STATUS = {
+    "R0A": "live",     # Manchester University NHS Foundation Trust (MFT)
+    "RBS": "nearing",  # Alder Hey Children's NHS Foundation Trust
+    "REP": "nearing",  # Liverpool Women's NHS Foundation Trust
+}
+TRUST_DELIVERY_LABELS = {"live": "Live", "nearing": "Nearing go-live", None: "Not live"}
+#: How many trusts the "recommended targets" list shows.
+DELIVERY_TARGETS_SHOWN = 10
+
+
+def _delivery_summary(trust_totals, total):
+    """The monthly report's "Reports actually delivered" section from
+    {(trust label, ODS code or None, ICS): report count} — counts and % of
+    `total` per TRUST_DELIVERY_STATUS status, and the top
+    DELIVERY_TARGETS_SHOWN trusts by volume that are neither live nor
+    already nearing go-live, as recommended targets — each with the
+    delivered % if it (and every target above it) went live, on top of the
+    live *and* nearing-go-live trusts (`baseline_pct`). Trusts with no ODS
+    code ("Unknown") are counted but can't be targets."""
+    def pct(n):
+        return round(100 * n / total, 1) if total else 0.0
+
+    statuses = []
+    for status in ("live", "nearing", None):
+        trusts = [(label, n) for (label, ods, _), n in trust_totals.items()
+                  if TRUST_DELIVERY_STATUS.get(ods) == status and n]
+        n = sum(c for _, c in trusts)
+        statuses.append({
+            "label": TRUST_DELIVERY_LABELS[status], "reports": n, "pct": pct(n),
+            # Named only for live/nearing — "Not live" is everyone else.
+            "trusts": sorted(label for label, _ in trusts) if status else [],
+        })
+
+    baseline = statuses[0]["reports"] + statuses[1]["reports"]
+    candidates = sorted(
+        ((label, ods, ics, n) for (label, ods, ics), n in trust_totals.items()
+         if ods and n and not TRUST_DELIVERY_STATUS.get(ods)),
+        key=lambda t: (-t[3], t[0]),
+    )[:DELIVERY_TARGETS_SHOWN]
+    targets, running = [], baseline
+    for label, ods, ics, n in candidates:
+        running += n
+        targets.append({
+            "name": label, "ics": short_icb_name(ics) if ics != "Unknown" else "Unknown",
+            "reports": n, "pct": pct(n), "cumulative_pct": pct(running),
+        })
+    return {"total": total, "statuses": statuses, "targets": targets, "baseline_pct": pct(baseline)}
+
+
 #: How many distinct code combinations the "Unclassified reports" table lists.
 UNCLASSIFIED_SIGNATURES_SHOWN = 25
 
@@ -2647,6 +2700,7 @@ def _build_monthly_report():
     # ics -> month -> category -> count; ics -> trust -> month -> category -> count
     ics_counts, trust_counts = {}, {}
     ics_region_names = {}  # ICB name -> NHS region name, for ICBs seen in the data
+    trust_ods = {}  # (ICS, trust label) -> ODS code, for the delivery section
     # ICS -> (report code, order code) -> count, for unclassified reports —
     # shows which codes need mapping (see _code_signature()).
     unclassified_by_ics = {}
@@ -2682,6 +2736,7 @@ def _build_monthly_report():
                     ics_region_names[ics] = geo["region_name"]
                 trust_name = _org_name(org)
                 trust = _org_display_name(trust_name or ordering_ods, ordering_ods) if (trust_name or ordering_ods) else "Unknown"
+                trust_ods[(ics, trust)] = ordering_ods
                 category = FhirClient.report_category(r.get("code"), order.get("code") if order else None)
                 if category == "unclassified":
                     signature = (
@@ -2754,6 +2809,16 @@ def _build_monthly_report():
 
     month_totals = [sum(r["months"][i] for r in ics_rows) for i in range(len(months))]
 
+    # "Reports actually delivered" — same ICS list (region filter) and
+    # same counting (category filter) as the ICS table, so its total
+    # matches that table's.
+    trust_totals = {}
+    for ics in ics_list:
+        for trust, trust_month_cats in trust_counts.get(ics, {}).items():
+            key = (trust, trust_ods.get((ics, trust)), ics)
+            trust_totals[key] = trust_totals.get(key, 0) + sum(count(trust_month_cats, mo) for mo in months)
+    delivery = _delivery_summary(trust_totals, sum(month_totals))
+
     # Unclassified reports' code combinations over the ICS list above
     # (region filter applied), most common first.
     unclassified_signatures = {}
@@ -2782,7 +2847,7 @@ def _build_monthly_report():
         category_month_totals=[sum(r["months"][i] for r in category_rows) for i in range(len(months))],
         truncated_months=truncated_months, max_pages=MONTHLY_REPORTS_MAX_PAGES,
         unclassified_signatures=unclassified_signatures, unclassified_total=sum(unclassified_signatures.values()),
-        unclassified_shown=UNCLASSIFIED_SIGNATURES_SHOWN,
+        unclassified_shown=UNCLASSIFIED_SIGNATURES_SHOWN, delivery=delivery,
     )
 
 

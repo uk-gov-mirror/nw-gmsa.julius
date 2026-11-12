@@ -1006,6 +1006,17 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   a resolved requester reference, and the ODS trust list's mixed-case
   name via an ODS code on the order), since rows group by name. Used by
   `_order_ordering()`/`_report_ordering()`, so daily stats gets it too.
+- **"Reports actually delivered"** — reports whose ordering trust
+  receives them electronically: counts and % of the total per status (Live
+  / Nearing go-live / Not live), then the **top 10 recommended target
+  trusts** by volume that are neither live nor nearing go-live, each with
+  a cumulative "delivered if live" % on top of live + nearing-go-live.
+  Live status is **maintained by hand** in `app.TRUST_DELIVERY_STATUS`
+  (by ODS code: `R0A` MFT live; `RBS` Alder Hey and `REP` Liverpool
+  Women's nearing go-live as of 2026-11) — update it as trusts go live.
+  Uses the same ICS list (region filter) and counting (category filter) as
+  the ICS table, so totals match. `_delivery_summary()` in `app.py`; also
+  in the PDF.
 - **"Unclassified reports — what codes do they carry?"** — a collapsed
   section under "Reports by category" listing the most common (report
   code, order code) combinations among unclassified reports

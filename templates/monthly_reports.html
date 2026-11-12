@@ -92,6 +92,41 @@
       </details>
     {% endif %}
 
+    <h2>Reports actually delivered{% if selected_region %} — {{ selected_region }}{% endif %}{% if selected_category_label %} — {{ selected_category_label }}{% endif %}</h2>
+    <p class="muted">
+      Reports whose ordering trust receives them electronically. Which trusts
+      are live is maintained by hand (<code>TRUST_DELIVERY_STATUS</code> in
+      <code>app.py</code>), not read from the data.
+    </p>
+    <table>
+      <tr><th>Status</th><th>Reports</th><th>% of total</th><th>Trusts</th></tr>
+      {% for s in delivery.statuses %}
+        <tr>
+          <td>{{ s.label }}</td><td>{{ s.reports }}</td><td>{{ s.pct }}%</td>
+          <td>{% if s.trusts %}{{ s.trusts|join(", ") }}{% elif s.label == "Not live" %}<span class="muted">All other trusts</span>{% else %}—{% endif %}</td>
+        </tr>
+      {% endfor %}
+      <tr><th>Total</th><th>{{ delivery.total }}</th><th>100%</th><th></th></tr>
+    </table>
+    {% if delivery.targets %}
+      <h3 style="font-size: 1rem;">Recommended targets — top {{ delivery.targets|length }} trusts by volume, not yet live or nearing go-live</h3>
+      <p class="muted">
+        Taking these live would deliver the most extra reports.
+        "Delivered if live" is the delivered % if that trust and every trust
+        above it went live, on top of the live and nearing-go-live trusts
+        ({{ delivery.baseline_pct }}% between them).
+      </p>
+      <table>
+        <tr><th>#</th><th>NHS trust</th><th>ICS</th><th>Reports</th><th>% of total</th><th>Delivered if live</th></tr>
+        {% for t in delivery.targets %}
+          <tr>
+            <td>{{ loop.index }}</td><td>{{ t.name }}</td><td>{{ t.ics }}</td>
+            <td>{{ t.reports }}</td><td>{{ t.pct }}%</td><td>{{ t.cumulative_pct }}%</td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% endif %}
+
     <h2>Reports by ICS{% if selected_region %} — {{ selected_region }}{% endif %}{% if selected_category_label %} — {{ selected_category_label }}{% endif %}</h2>
     <div style="overflow-x: auto;">
       <table>

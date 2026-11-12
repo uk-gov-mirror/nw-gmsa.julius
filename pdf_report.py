@@ -279,6 +279,36 @@ def monthly_report_pdf_bytes(report):
         name_width=200,
     ))
 
+    delivery = report.get("delivery")
+    if delivery:
+        suffix = (f" — {region}" if region else "") + (f" — {category_label}" if category_label else "")
+        story.append(_para(escape("Reports actually delivered" + suffix), "Heading2"))
+        story.append(_para("Reports whose ordering trust receives them electronically (live trusts are maintained by hand in app.py)."))
+        rows = [["Status", "Reports", "% of total", "Trusts"]]
+        for st in delivery["statuses"]:
+            trusts = ", ".join(st["trusts"]) if st["trusts"] else ("All other trusts" if st["label"] == "Not live" else "—")
+            rows.append([st["label"], st["reports"], f"{st['pct']}%", _name_cell(trusts)])
+        rows.append(["Total", delivery["total"], "100%", ""])
+        t = Table(rows, colWidths=[110, 70, 70, _CONTENT_WIDTH - 250], repeatRows=1)
+        t.setStyle(TableStyle(list(_TABLE_STYLE.getCommands()) + [
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f0f0f0")),
+        ]))
+        story.append(t)
+        if delivery["targets"]:
+            story.append(Spacer(1, 8))
+            story.append(_para(
+                f"<b>Recommended targets</b> &mdash; top {len(delivery['targets'])} trusts by volume, not yet live or "
+                f"nearing go-live. &ldquo;Delivered if live&rdquo; is the delivered % if that trust and every trust above "
+                f"it went live, on top of the live and nearing-go-live trusts ({delivery['baseline_pct']}% between them)."))
+            rows = [["#", "NHS trust", "ICS", "Reports", "% of total", "Delivered if live"]]
+            for i, tg in enumerate(delivery["targets"], 1):
+                rows.append([i, _name_cell(tg["name"]), _name_cell(tg["ics"]), tg["reports"],
+                             f"{tg['pct']}%", f"{tg['cumulative_pct']}%"])
+            t = Table(rows, colWidths=[25, _CONTENT_WIDTH - 450, 170, 70, 85, 100], repeatRows=1)
+            t.setStyle(_TABLE_STYLE)
+            story.append(t)
+
     heading = "Reports by ICS" + (f" — {region}" if region else "") + (f" — {category_label}" if category_label else "")
     story.append(_para(escape(heading), "Heading2"))
     show_region = not region
