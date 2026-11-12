@@ -818,11 +818,20 @@ Queries `ServiceRequest`/`DiagnosticReport` system-wide for a date range
 `max_pages` if a high-volume range silently hits the cap). Breaks results down
 by day, organisation, indication, ICS, and country.
 
-- **`orders_in_range()`/`reports_in_range()` bundle patient/requester (and,
-  for reports, the originating order via `_include=DiagnosticReport:based-on`
-  + that order's requester one hop further) via `_include`/`_include:iterate`,
-  same as `ctdna_orders()`/`_active_orders_with_intent()`, and seed the
-  reference cache from them (`_cache_included()`).** This used to be a
+- **`orders_in_range()` bundles patient/requester (+ `_include:iterate`
+  for a PractitionerRole requester); `reports_in_range()` bundles only
+  patient/performer — one hop, and deliberately no ServiceRequest.** Both
+  seed the reference cache (`_cache_included()`). `reports_in_range()`
+  used to also `_include=DiagnosticReport:based-on` + the order's
+  requester chain, which **413'd on production** (a month of reports;
+  `_count` backoff to 5 didn't help) — so nothing on `/stats`,
+  `/stats/organisation`, `/stats/ics` or `/stats/monthly-reports` reads a
+  report's ServiceRequest any more. A report is paired with an order only
+  if that order is already in `orders_in_range()`'s result
+  (`FhirClient.index_orders()` + `match_report_order()` — by `basedOn`'s
+  literal reference, else its logical identifier; never a fetch), and its
+  ordering organisation comes off the report itself (`app._report_ordering()`
+  → `report_ordering_organisation()`; see "Monthly reports" below). This used to be a
   plain `_search_all()` with no `_include` at all — `app.stats()` calls
   `patient_for()`/`order_organisation_resource()`/`report_organisation()`/
   `order_for_report()` once per row, so every one of those was a separate
@@ -830,10 +839,11 @@ by day, organisation, indication, ICS, and country.
   count (not distinct-entity count, since patients rarely repeat within a
   week) and was slow enough to time the page out on a real week of data.
 - Order indication comes from `ServiceRequest.reasonCode`.
-- Reports don't carry their own indication: `report_indication()` follows
-  `DiagnosticReport.basedOn` back to the originating order and reuses its
-  `reasonCode`, falling back to the report's own `conclusionCode` if the link
-  can't be resolved.
+- Reports don't carry their own indication: `report_indication(report,
+  order)` uses the matched order's `reasonCode` when the order is in range,
+  else the indication encoded in the report's own Test Directory code
+  (`"R240"` from `R240.1`, plus its description), else `conclusionCode` —
+  it never fetches the order.
 - Stats still resolves one `Patient` per order/report for ICS/country, but
   the `_include` above means that's now a cache hit rather than a GET for
   every patient the paginated queries actually returned — the only way it
@@ -920,14 +930,14 @@ by day, organisation, indication, ICS, and country.
   "Reports by performing organisation", which is who *produced* the
   report, from `DiagnosticReport.performer` via `report_organisation()`)
   and "Reports by patient ICS":
-  - "Ordering provider" is who *ordered* the test — resolved via
-    `order_for_report(report)` (the report's originating `ServiceRequest`,
-    same lookup the Cepheid screen uses) and then the same
-    `order_organisation()`/`order_organisation_resource()` chain the
-    orders side uses. `orders_by_organisation_geocoded()` is reused
-    unchanged for the map (it just takes a plain list of ServiceRequest
-    resources — the caller passes each report's originating order instead
-    of the order itself, so counts land per-report). `report_rows` grew an
+  - "Ordering provider" is who *ordered* the test — read off the report
+    itself (`app._report_ordering()`: `report_ordering_organisation()`,
+    falling back to the in-range matched order's
+    `order_organisation_resource()`), not its ServiceRequest (see the
+    413 note above). The map uses `organisations_geocoded()` — the
+    grouping/geocoding `orders_by_organisation_geocoded()` now wraps —
+    over each report's (organisation, name) pair, so counts land
+    per-report. `report_rows` grew an
     `ordering_provider` field (alongside the pre-existing `organisation`
     field, which stays the *performing* org) so `report_by_ordering_provider`
     can use the same `group_count()` table pattern as everywhere else.
@@ -947,19 +957,27 @@ Management Reports. Queried **one month at a time** (`reports_in_range(...,
 max_pages=MONTHLY_REPORTS_MAX_PAGES)`), so each search stays bounded; a
 month that hits the page cap is flagged on the page as possibly incomplete.
 
-- **ICS and trust both come from the report's ordering organisation**
-  (`order_for_report()` → `order_organisation_resource()`) — trust is
-  that organisation (`"Name (ODS)"`), ICS is `organisation_ics()` on it,
-  the same derivation `/stats`' "Reports by ordering provider's ICS"
-  uses. Each ICS row expands (client-side, hidden by default) into its
-  trusts.
+- **DiagnosticReport only — no ServiceRequest, no `_include` at all**
+  (`reports_in_range(..., with_includes=False)`). The original version
+  `_include`d `DiagnosticReport:based-on` + the requester chain and 413'd
+  on production for a single month. The ordering trust's ODS code is read
+  off the report itself (`report_ordering_ods()`:
+  `encounter.identifier.assigner`, else the PLAC-typed
+  `basedOn.identifier.assigner`, skipping the report's own performer —
+  the GLH, e.g. `699X0`), then `organisation_by_ods()` resolves it to a
+  name/postcode (this server's Organization, topped up from the NHS ODS
+  API's `GeoLoc`), and the ICS is `organisation_ics()` on that. **Which of
+  those assigners this server actually populates is unconfirmed** — if
+  everything lands in "Unknown", sample a real report's `encounter`/
+  `basedOn`. Each ICS row expands (client-side, hidden by default) into
+  its trusts.
 - **NHS region filter** — `app.NHS_REGION_ICBS`, a hardcoded region →
   official ICB23NM list (7 regions, 42 ICBs). Picking a region lists
   *every* ICS in it, zero-filled. `ics_region()` maps any ICS name onto
   this via the same `_normalize_icb_name()`/`_best_icb_match()` pair the
   choropleths use.
 - **Categories are inferred from the test code** —
-  `FhirClient.report_category()` (report's own `code`, then its order's),
+  `FhirClient.report_category()` (the report's own `code`),
   rules documented in its docstring: H&I (Histotrac codes, M118/R428/M242,
   HLA/chimerism) → pharmacogenomics (DPYD/TPMT/NUDT15/CYP2xx, R454, RX06/
   RX07) → WGS (M/MX/HX codes as "Cancer Whole Genomic Sequencing", the

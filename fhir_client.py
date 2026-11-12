@@ -86,6 +86,7 @@ class FhirClient:
         self._ref_cache = {}  # reference string -> resolved resource (or None); process-lifetime only
         self._geocode_cache = {}  # normalized postcode -> (lat, lon) or None; process-lifetime only
         self._org_ics_cache = {}  # Organization.id -> ICB23NM name (or None); process-lifetime only
+        self._org_by_ods_cache = {}  # ODS code -> Organization-shaped dict (or None); process-lifetime only
 
     def _auth(self):
         return HTTPBasicAuth(self.user, self.password) if self.user else None
@@ -1401,24 +1402,31 @@ class FhirClient:
         self._cache_included(included)
         return matches
 
-    def reports_in_range(self, start_date, end_date, max_pages=10):
+    def reports_in_range(self, start_date, end_date, max_pages=10, with_includes=True):
         """All genomic test reports dated within [start_date, end_date]
-        (ISO dates), across all patients — used by the daily stats screen.
+        (ISO dates), across all patients — used by the daily stats and
+        monthly report screens.
 
-        Bundles each report's patient, performer, and originating
-        ServiceRequest (via `_include=DiagnosticReport:based-on`) plus
-        that order's requester one hop further (`_include:iterate`, same
-        Practitioner/Organization chain as orders_in_range() above), and
-        seeds the reference cache from them. app.stats() calls
-        patient_for(), report_organisation(), order_for_report(), and
-        order_organisation_resource() once per row — same N+1 concern as
-        orders_in_range(), just with more references per row."""
+        Bundles each report's patient and performer (one hop, via
+        `_include`) and seeds the reference cache from them, so
+        patient_for()/report_organisation() per row are cache hits.
+
+        **Deliberately no ServiceRequest** — this used to also
+        `_include=DiagnosticReport:based-on` plus the order's requester
+        chain (`_include:iterate`), which 413'd on production for a single
+        month of reports. Everything the stats screens took from the order
+        now comes off the report itself (report_ordering_organisation(),
+        report_indication()), or from the date-range order search the
+        caller already has (match_report_order()).
+
+        `with_includes=False` drops the patient/performer includes too —
+        the monthly report doesn't use either."""
         params = {
             "date": [f"ge{start_date}", f"le{end_date}"],
             "_count": 100,
-            "_include": ["DiagnosticReport:patient", "DiagnosticReport:performer", "DiagnosticReport:based-on"],
-            "_include:iterate": ["ServiceRequest:requester"] + SERVICE_REQUEST_ITERATE_INCLUDES,
         }
+        if with_includes:
+            params["_include"] = ["DiagnosticReport:patient", "DiagnosticReport:performer"]
         try:
             matches, included = self._search_all_split(
                 "DiagnosticReport", {**params, "category": DIAGNOSTIC_REPORT_CATEGORY}, max_pages=max_pages)
@@ -1845,6 +1853,151 @@ class FhirClient:
                 return (resp.json().get("Organisation") or {}).get("Name")
         except requests.RequestException:
             pass
+        return None
+
+    @classmethod
+    def ods_lookup(cls, ods_code):
+        """(name, postcode) for an ODS code from the NHS ODS lookup API
+        (same endpoint as ods_lookup_name()), or (None, None) if it can't
+        be resolved — never raises."""
+        if not ods_code:
+            return None, None
+        try:
+            resp = requests.get(f"{cls.ODS_LOOKUP_API_URL}/{quote(ods_code)}", timeout=10)
+            if resp.ok:
+                org = resp.json().get("Organisation") or {}
+                location = (org.get("GeoLoc") or {}).get("Location") or {}
+                return org.get("Name"), location.get("PostCode")
+        except requests.RequestException:
+            pass
+        return None, None
+
+    def organisation_by_ods(self, ods_code):
+        """An Organization-shaped dict for an ODS code — this FHIR
+        server's own Organization if it has one (search_organizations()),
+        with a missing name/postcode filled in from the NHS ODS lookup
+        API (ods_lookup()); just the ODS API's data if the server has no
+        such Organization. None if neither knows the code. `id` is the
+        server's id, or "ods-<code>" for an ODS-API-only one — either way
+        stable, so organisation_ics()'s per-id cache still works. Cached
+        per ODS code for the process lifetime — the same trusts recur
+        across every month's reports."""
+        if not ods_code:
+            return None
+        if ods_code in self._org_by_ods_cache:
+            return self._org_by_ods_cache[ods_code]
+        try:
+            matches = self.search_organizations(ods_code=ods_code)
+        except requests.HTTPError:
+            matches = []
+        org = dict(matches[0]) if matches else None
+        if not org or not org.get("name") or not self.organisation_postcode(org):
+            name, postcode = self.ods_lookup(ods_code)
+            if name or postcode or org:
+                org = org or {
+                    "resourceType": "Organization", "id": f"ods-{ods_code}",
+                    "identifier": [{"system": self.ODS_ORGANIZATION_CODE_SYSTEM, "value": ods_code}],
+                }
+                org["name"] = org.get("name") or (self._ods_name_case(name) if name else ods_code)
+                if postcode and not self.organisation_postcode(org):
+                    org["address"] = (org.get("address") or []) + [{"postalCode": postcode}]
+        self._org_by_ods_cache[ods_code] = org
+        return org
+
+    @staticmethod
+    def _ods_name_case(name):
+        """ODS's upper-case names ("ALDER HEY CHILDREN'S NHS FOUNDATION
+        TRUST") as readable title case, keeping NHS/GP/ICB upper case and
+        "'s" lower case."""
+        titled = re.sub(r"[A-Za-z]+('[A-Za-z]+)?", lambda m: m.group(0).capitalize(), name.lower())
+        return re.sub(r"\b(Nhs|Gp|Icb|Uk)\b", lambda m: m.group(0).upper(), titled)
+
+    def report_ordering_organisation(self, report):
+        """The ordering organisation for a DiagnosticReport as an
+        Organization-shaped dict (organisation_by_ods() on
+        report_ordering_ods()), from the report alone — None if the
+        report doesn't say."""
+        return self.organisation_by_ods(self.report_ordering_ods(report))
+
+    @classmethod
+    def index_orders(cls, orders):
+        """{key: ServiceRequest} for match_report_order() — keyed by
+        "ServiceRequest/<id>" and by every identifier as both
+        "system|value" and bare "value"."""
+        index = {}
+        for o in orders:
+            if o.get("id"):
+                index[f"ServiceRequest/{o['id']}"] = o
+            for ident in o.get("identifier", []):
+                if ident.get("value"):
+                    index.setdefault(f"{ident.get('system')}|{ident['value']}", o)
+                    index.setdefault(ident["value"], o)
+        return index
+
+    @staticmethod
+    def match_report_order(report, orders_index):
+        """The report's originating ServiceRequest *if it's already in
+        `orders_index`* (index_orders() over orders the caller already
+        fetched, e.g. orders_in_range()) — matched by `basedOn`'s literal
+        reference, else its logical identifier (system|value, then value).
+        Never fetches; None if it isn't there. The fetch-free alternative
+        to order_for_report() for the stats screens."""
+        for ref in report.get("basedOn", []):
+            literal = ref.get("reference") or ""
+            if "ServiceRequest/" in literal:
+                key = "ServiceRequest/" + literal.split("ServiceRequest/")[-1].split("/")[0]
+                if key in orders_index:
+                    return orders_index[key]
+            ident = ref.get("identifier") or {}
+            if ident.get("value"):
+                for key in (f"{ident.get('system')}|{ident['value']}", ident["value"]):
+                    if key in orders_index:
+                        return orders_index[key]
+        return None
+
+    def report_ordering_ods(self, report):
+        """The ordering (requesting) organisation's ODS code, read from
+        the DiagnosticReport itself — no ServiceRequest fetch/include:
+
+        1. `encounter.identifier.assigner` — the trust's own encounter/
+           spell number (the IG's worked example: assigner "R0A").
+        2. `basedOn[].identifier.assigner` on a PLAC-typed (placer order
+           number) identifier — the requesting system assigns the placer
+           number.
+
+        Either is skipped when it's the same ODS code as the report's own
+        `performer` (the GLH/lab — the IG's examples have the lab, 699X0,
+        as assigner on basedOn), since that's who *did* the test, not who
+        ordered it. None if neither gives anything else."""
+        performer_ods = {
+            ods for ods in (self.resolve_organisation_ods_inline(p) for p in report.get("performer", []))
+            if ods
+        }
+        candidates = [((report.get("encounter") or {}).get("identifier") or {}).get("assigner")]
+        for ref in report.get("basedOn", []):
+            ident = ref.get("identifier") or {}
+            type_codes = [c.get("code") for c in (ident.get("type") or {}).get("coding", [])]
+            if self.PLACER_IDENTIFIER_TYPE in type_codes:
+                candidates.append(ident.get("assigner"))
+        for assigner in candidates:
+            ods = self.resolve_organisation_ods_inline(assigner)
+            if ods and ods not in performer_ods:
+                return ods
+        return None
+
+    def resolve_organisation_ods_inline(self, org_ref):
+        """ODS code from an Organization-typed Reference's own inline
+        `identifier` (a logical reference) — no fetch, unlike
+        resolve_organisation_ods(). Falls back to that (which may GET)
+        only when the reference has a literal `.reference` and no inline
+        identifier."""
+        if not org_ref:
+            return None
+        ident = org_ref.get("identifier") or {}
+        if ident.get("value") and (not ident.get("system") or ident.get("system") == self.ODS_ORGANIZATION_CODE_SYSTEM):
+            return ident["value"]
+        if org_ref.get("reference"):
+            return self.resolve_organisation_ods(org_ref)
         return None
 
     def update_organization_name(self, organization, name):
@@ -2381,23 +2534,34 @@ class FhirClient:
         performers = report.get("performer", [])
         return performers[0].get("display") if performers else None
 
-    def report_indication(self, report):
+    def report_indication(self, report, order=None):
         """
-        Genomic disease / clinical indication for a DiagnosticReport.
-        DiagnosticReport itself has no reasonCode, so we follow `basedOn`
-        back to the originating ServiceRequest and use its reasonCode —
-        the same value set as order_indication(). Falls back to
-        `conclusionCode` (the report's own clinical conclusion) if the
-        order can't be resolved, though that's a related-but-different
-        field (interpretation of results, not indication for testing).
+        Genomic disease / clinical indication for a DiagnosticReport —
+        never fetches anything. DiagnosticReport has no reasonCode, so:
+
+        1. `order`'s reasonCode, if the caller already has the
+           originating ServiceRequest (match_report_order()) — the same
+           value set as order_indication().
+        2. The indication encoded in the report's own Test Directory code
+           — the part before the "." ("R240" from "R240.1"), described via
+           genomic_clinical_indication_display().
+        3. `conclusionCode` — related-but-different (interpretation of
+           results, not indication for testing), last resort.
+
+        This used to follow `basedOn` with a GET per report — dropped
+        along with reports_in_range()'s ServiceRequest include (413s on
+        production).
         """
-        for ref in report.get("basedOn", []):
-            sr = self.resolve_reference(ref)
-            if sr and sr.get("resourceType") == "ServiceRequest":
-                labels = [self._code_text(rc) for rc in sr.get("reasonCode", [])]
-                labels = [l for l in labels if l]
-                if labels:
-                    return "; ".join(labels)
+        if order:
+            labels = [self._code_text(rc) for rc in order.get("reasonCode", [])]
+            labels = [l for l in labels if l]
+            if labels:
+                return "; ".join(labels)
+        test_code = self.test_directory_code(report.get("code"))
+        if test_code:
+            indication = test_code.split(".")[0]
+            display = self.genomic_clinical_indication_display(indication)
+            return f"{indication} {display}" if display != indication else indication
         labels = [self._code_text(cc) for cc in report.get("conclusionCode", [])]
         labels = [l for l in labels if l]
         return "; ".join(labels) if labels else "Unspecified"

@@ -130,8 +130,9 @@
 
 <h2>Reports by ordering provider</h2>
 <p class="muted">
-    The organisation that <em>ordered</em> the test (via the report's
-    originating <code>ServiceRequest</code>), as opposed to "Reports by
+    The organisation that <em>ordered</em> the test (read off the report
+    itself — its encounter or placer order number's assigning
+    organisation — not its <code>ServiceRequest</code>), as opposed to "Reports by
     performing organisation" above (the lab that produced the report).
 </p>
 {% if report_map_points %}
@@ -271,7 +272,7 @@
   {{ render_pivot(report_pivot_org, "Date", "reports") }}
 
   <h2>Reports by genomic disease / indication</h2>
-  <p class="muted">Resolved from the originating order's reason code where possible, falling back to the report's own conclusion code.</p>
+  <p class="muted">The originating order's reason code where that order is in this date range's orders, otherwise the indication from the report's own test code (e.g. "R240" from R240.1), falling back to its conclusion code.</p>
   {% if report_by_indication %}
     <table>
       <tr><th>Indication</th><th>Reports</th></tr>

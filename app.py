@@ -1865,15 +1865,22 @@ def orders_by_organisation_geocoded(orders):
     organisations/orders couldn't be placed, rather than that count being
     silently dropped.
 
-    Takes a plain list of ServiceRequest resources, so the "Reports by
-    ordering provider" map reuses this unchanged — the caller passes each
-    report's originating order (client.order_for_report(r)) instead of the
-    order itself, and counts come out per-report rather than per-order.
+    The "Reports by ordering provider" map uses organisations_geocoded()
+    directly, with each report's ordering organisation (_report_ordering()).
     """
+    return organisations_geocoded(
+        (client.order_organisation_resource(order), client.order_organisation(order))
+        for order in orders
+    )
+
+
+def organisations_geocoded(org_items):
+    """orders_by_organisation_geocoded()'s grouping/geocoding, over
+    (Organization resource or None, fallback display name) pairs — one
+    pair per counted order/report."""
     orgs = {}
-    for order in orders:
-        org_resource = client.order_organisation_resource(order)
-        name = (org_resource.get("name") if org_resource else None) or client.order_organisation(order) or "Unknown"
+    for org_resource, fallback_name in org_items:
+        name = (org_resource.get("name") if org_resource else None) or fallback_name or "Unknown"
         key = (org_resource.get("id") if org_resource else None) or name
         if key not in orgs:
             geocode = client.organisation_geocode(org_resource) if org_resource else None
@@ -2150,6 +2157,66 @@ def group_rows_by_organisation(rows):
     return [(org, groups[org]) for org in orgs]
 
 
+def _report_ordering(report, orders_index):
+    """(matched order or None, ordering Organization resource or None,
+    ordering organisation name) for one DiagnosticReport on the /stats
+    screens — without fetching the report's ServiceRequest (that
+    `_include` 413'd on production; see reports_in_range()).
+
+    The order is only the one already in `orders_index` (index_orders()
+    over orders_in_range()'s result — client.match_report_order()). The
+    organisation comes off the report itself
+    (client.report_ordering_organisation()), falling back to the matched
+    order's requesting organisation."""
+    order = client.match_report_order(report, orders_index)
+    org = client.report_ordering_organisation(report)
+    if not org and order:
+        org = client.order_organisation_resource(order)
+    name = (org.get("name") if org else None) or (client.order_organisation(order) if order else None) or "Unknown"
+    return order, org, name
+
+
+def _reports_by_order_id(reports, orders_index):
+    """{order id: most recently issued report} over reports whose
+    originating order is in `orders_index` (match_report_order()) — the
+    stats drill-downs' pairing of orders with their reports."""
+    by_order = {}
+    for r in reports:
+        order = client.match_report_order(r, orders_index)
+        if not order:
+            continue
+        oid = order.get("id")
+        existing = by_order.get(oid)
+        issued = r.get("issued") or r.get("effectiveDateTime") or ""
+        existing_issued = (existing.get("issued") or existing.get("effectiveDateTime") or "") if existing else ""
+        if existing is None or issued > existing_issued:
+            by_order[oid] = r
+    return by_order
+
+
+def _report_only_row(r, order):
+    """A /stats drill-down row for a report whose order wasn't in the
+    fetched order range (or didn't match) — order-only fields "—"."""
+    patient = client.patient_for(r)
+    return {
+        "order_id": order.get("id") if order else None,
+        "report_id": r.get("id"),
+        "patient_id": patient.get("id") if patient else None,
+        "patient_name": human_name(patient) if patient else "Unknown",
+        "requester": client.requesting_clinician_display(order) if order else "—",
+        "test": FhirClient.test_directory_code(r.get("code")) or "—",
+        "status": r.get("status") or "—",
+        "order_date": (order.get("authoredOn") if order else None) or "—",
+        "collected_date": "—",
+        "received_date": "—",
+        "reported_date": (r.get("issued") or r.get("effectiveDateTime") or "")[:10] or "—",
+        "placer_id": (FhirClient.placer_identifier(order) if order else None) or "—",
+        "igene_id": client.igene_report_identifier(order or {}, r) or "—",
+        "conclusion": "; ".join(code_text(cc) for cc in (r.get("conclusionCode") or [])) or "—",
+        "spell_id": (client.hospital_spell_identifier(order) if order else None) or client.hospital_spell_identifier(r) or "—",
+    }
+
+
 @app.route("/stats")
 def stats():
     end = request.args.get("end") or date.today().isoformat()
@@ -2182,30 +2249,27 @@ def stats():
         order_ics_map_html, order_ics_map_unmatched_count, order_ics_map_unmatched_names = ics_choropleth_html(group_count(order_rows, "ics"))
 
         reports = client.reports_in_range(start, end)
+        orders_index = FhirClient.index_orders(orders)
         report_rows = []
-        report_orders = []
+        report_orgs = []
         for r in reports:
             patient = client.patient_for(r)
-            # order_for_report()'s originating ServiceRequest — separate from
-            # report_organisation() (the *performing* lab, from
-            # DiagnosticReport.performer): this is who *ordered* the test,
-            # i.e. the same "requesting organisation" concept the orders
-            # side already maps, just resolved via the report's `basedOn`.
-            ordering_order = client.order_for_report(r)
-            ordering_org_resource = None
-            if ordering_order:
-                report_orders.append(ordering_order)
-                ordering_org_resource = client.order_organisation_resource(ordering_order)
+            # Who *ordered* the test — separate from report_organisation()
+            # (the *performing* lab, from DiagnosticReport.performer). Read
+            # off the report itself, not its ServiceRequest (see
+            # _report_ordering()).
+            ordering_order, ordering_org_resource, ordering_name = _report_ordering(r, orders_index)
+            report_orgs.append((ordering_org_resource, ordering_name))
             report_rows.append({
                 "date": (r.get("issued") or r.get("effectiveDateTime") or "")[:10] or "Unknown",
                 "organisation": client.report_organisation(r) or "Unknown",
-                "ordering_provider": (client.order_organisation(ordering_order) if ordering_order else None) or "Unknown",
-                "indication": client.report_indication(r),
+                "ordering_provider": ordering_name,
+                "indication": client.report_indication(r, ordering_order),
                 "ics": client.organisation_ics(ordering_org_resource) or "Unknown",
                 "country": client.patient_country(patient) or "Unknown",
             })
 
-        report_org_geo = orders_by_organisation_geocoded(report_orders)
+        report_org_geo = organisations_geocoded(report_orgs)
         report_map_points = [g for g in report_org_geo if g["lat"] is not None and g["lon"] is not None]
         report_map_unmapped_count = sum(g["count"] for g in report_org_geo if g["lat"] is None)
 
@@ -2280,17 +2344,8 @@ def stats_organisation():
         orders = client.orders_in_range(start, end)
         reports = client.reports_in_range(start, end)
 
-        report_by_order_id = {}
-        for r in reports:
-            ordering_order = client.order_for_report(r)
-            if not ordering_order:
-                continue
-            oid = ordering_order.get("id")
-            existing = report_by_order_id.get(oid)
-            issued = r.get("issued") or r.get("effectiveDateTime") or ""
-            existing_issued = (existing.get("issued") or existing.get("effectiveDateTime") or "") if existing else ""
-            if existing is None or issued > existing_issued:
-                report_by_order_id[oid] = r
+        orders_index = FhirClient.index_orders(orders)
+        report_by_order_id = _reports_by_order_id(reports, orders_index)
 
         matched_order_ids = set()
         order_test_rows, report_test_rows = [], []
@@ -2310,31 +2365,13 @@ def stats_organisation():
         # the report itself is within range) — still shown, with
         # order-only fields left as "—", rather than silently dropped.
         for r in reports:
-            ordering_order = client.order_for_report(r)
-            ordering_provider = (client.order_organisation(ordering_order) if ordering_order else None) or "Unknown"
+            ordering_order, _, ordering_provider = _report_ordering(r, orders_index)
             if ordering_provider != org:
                 continue
             report_test_rows.append({"test": FhirClient.test_directory_code(r.get("code")) or "—"})
             if ordering_order and ordering_order.get("id") in matched_order_ids:
                 continue  # already emitted above, via its order
-            patient = client.patient_for(r)
-            row = {
-                "order_id": ordering_order.get("id") if ordering_order else None,
-                "report_id": r.get("id"),
-                "patient_id": patient.get("id") if patient else None,
-                "patient_name": human_name(patient) if patient else "Unknown",
-                "requester": client.requesting_clinician_display(ordering_order) if ordering_order else "—",
-                "test": FhirClient.test_directory_code(r.get("code")) or "—",
-                "status": r.get("status") or "—",
-                "order_date": (ordering_order.get("authoredOn") if ordering_order else None) or "—",
-                "collected_date": "—",
-                "received_date": "—",
-                "reported_date": (r.get("issued") or r.get("effectiveDateTime") or "")[:10] or "—",
-                "placer_id": (FhirClient.placer_identifier(ordering_order) if ordering_order else None) or "—",
-                "igene_id": client.igene_report_identifier(ordering_order or {}, r) or "—",
-                "conclusion": "; ".join(code_text(cc) for cc in (r.get("conclusionCode") or [])) or "—",
-                "spell_id": (client.hospital_spell_identifier(ordering_order) if ordering_order else None) or client.hospital_spell_identifier(r) or "—",
-            }
+            row = _report_only_row(r, ordering_order)
             if org == "Unknown":
                 row["requester_code"] = _requester_code(ordering_order)
             rows.append(row)
@@ -2380,17 +2417,8 @@ def stats_ics():
         orders = client.orders_in_range(start, end)
         reports = client.reports_in_range(start, end)
 
-        report_by_order_id = {}
-        for r in reports:
-            ordering_order = client.order_for_report(r)
-            if not ordering_order:
-                continue
-            oid = ordering_order.get("id")
-            existing = report_by_order_id.get(oid)
-            issued = r.get("issued") or r.get("effectiveDateTime") or ""
-            existing_issued = (existing.get("issued") or existing.get("effectiveDateTime") or "") if existing else ""
-            if existing is None or issued > existing_issued:
-                report_by_order_id[oid] = r
+        orders_index = FhirClient.index_orders(orders)
+        report_by_order_id = _reports_by_order_id(reports, orders_index)
 
         matched_order_ids = set()
         order_test_rows, report_test_rows = [], []
@@ -2407,32 +2435,14 @@ def stats_ics():
         # result for this range — still shown, order-only fields "—",
         # same reasoning as stats_organisation().
         for r in reports:
-            ordering_order = client.order_for_report(r)
-            ordering_org_resource = client.order_organisation_resource(ordering_order) if ordering_order else None
+            ordering_order, ordering_org_resource, _ = _report_ordering(r, orders_index)
             report_ics = client.organisation_ics(ordering_org_resource) or "Unknown"
             if report_ics != ics:
                 continue
             report_test_rows.append({"test": FhirClient.test_directory_code(r.get("code")) or "—"})
             if ordering_order and ordering_order.get("id") in matched_order_ids:
                 continue  # already emitted above, via its order
-            patient = client.patient_for(r)
-            rows.append({
-                "order_id": ordering_order.get("id") if ordering_order else None,
-                "report_id": r.get("id"),
-                "patient_id": patient.get("id") if patient else None,
-                "patient_name": human_name(patient) if patient else "Unknown",
-                "requester": client.requesting_clinician_display(ordering_order) if ordering_order else "—",
-                "test": FhirClient.test_directory_code(r.get("code")) or "—",
-                "status": r.get("status") or "—",
-                "order_date": (ordering_order.get("authoredOn") if ordering_order else None) or "—",
-                "collected_date": "—",
-                "received_date": "—",
-                "reported_date": (r.get("issued") or r.get("effectiveDateTime") or "")[:10] or "—",
-                "placer_id": (FhirClient.placer_identifier(ordering_order) if ordering_order else None) or "—",
-                "igene_id": client.igene_report_identifier(ordering_order or {}, r) or "—",
-                "conclusion": "; ".join(code_text(cc) for cc in (r.get("conclusionCode") or [])) or "—",
-                "spell_id": (client.hospital_spell_identifier(ordering_order) if ordering_order else None) or client.hospital_spell_identifier(r) or "—",
-            })
+            rows.append(_report_only_row(r, ordering_order))
 
         order_by_test = group_count(order_test_rows, "test")
         report_by_test = group_count(report_test_rows, "test")
@@ -2564,12 +2574,14 @@ def monthly_reports():
     only; the current month can be picked too, counted up to today), by ICS and report category, filterable by NHS region and
     category, with each ICS expandable into its NHS trusts.
 
-    ICS and trust are both from the report's *ordering* organisation
-    (order_for_report() -> order_organisation_resource()), the same
-    "Reports by ordering provider's ICS" derivation /stats uses — the trust
-    is the requesting organisation, the ICS is the ICB its postcode falls
-    in (organisation_ics()). Category is FhirClient.report_category() on
-    the report's own code, falling back to its originating order's.
+    Uses the DiagnosticReport alone — no ServiceRequest (an
+    `_include=DiagnosticReport:based-on` chain made a month's search 413 on
+    production). The trust is the ordering organisation's ODS code read off
+    the report (client.report_ordering_ods(): encounter identifier
+    assigner, else placer-number assigner), resolved to a name/postcode by
+    client.organisation_by_ods(); the ICS is the ICB that postcode falls in
+    (organisation_ics()). Category is FhirClient.report_category() on the
+    report's own code.
 
     Queried one month at a time (reports_in_range() per month) rather than
     one big range, so each search stays bounded — see "413s on unfiltered
@@ -2607,19 +2619,18 @@ def monthly_reports():
             month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
             month_end = min(month_end, today)
             reports = client.reports_in_range(month_start.isoformat(), month_end.isoformat(),
-                                              max_pages=MONTHLY_REPORTS_MAX_PAGES)
+                                              max_pages=MONTHLY_REPORTS_MAX_PAGES, with_includes=False)
             if len(reports) >= MONTHLY_REPORTS_MAX_PAGES * 100:
                 truncated_months.append(month)
             for r in reports:
                 if r.get("id") in seen:
                     continue
                 seen.add(r.get("id"))
-                order = client.order_for_report(r)
-                org = client.order_organisation_resource(order) if order else None
+                ordering_ods = client.report_ordering_ods(r)
+                org = client.organisation_by_ods(ordering_ods)
                 ics, _ = ics_region(client.organisation_ics(org) or "Unknown")
-                trust_name = (org.get("name") if org else None) or (client.order_organisation(order) if order else None)
-                trust = _org_display_name(trust_name, client.organisation_ods_code(org) if org else None) if trust_name else "Unknown"
-                category = FhirClient.report_category(r.get("code"), order.get("code") if order else None)
+                trust = _org_display_name(org.get("name") or ordering_ods, ordering_ods) if org else (ordering_ods or "Unknown")
+                category = FhirClient.report_category(r.get("code"))
                 by_cat = ics_counts.setdefault(ics, {}).setdefault(month, {})
                 by_cat[category] = by_cat.get(category, 0) + 1
                 by_cat = trust_counts.setdefault(ics, {}).setdefault(trust, {}).setdefault(month, {})
