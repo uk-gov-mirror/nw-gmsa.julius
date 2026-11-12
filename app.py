@@ -2244,16 +2244,21 @@ def _report_ordering(report, orders_index):
 
 def _orders_index_for_reports(reports, orders=()):
     """index_orders() over `orders` (e.g. orders_in_range()'s, possibly
-    none) plus the originating ServiceRequests of every report that has
-    no ordering ODS code of its own and whose order isn't already in
-    `orders` — fetched in batches by client.service_requests_for_reports()
-    (`_id=a,b,c,...`, no `_include`). Most production reports carry the
-    trust's ODS code only on their ServiceRequest (requester.identifier),
-    so without this most of them came out "Unknown"."""
+    none) plus the originating ServiceRequests of every report whose order
+    isn't already in `orders` and that needs it — no ordering ODS code of
+    its own, *or* no test code the categoriser recognises — fetched in
+    batches by client.service_requests_for_reports() (`_id=a,b,c,...`, no
+    `_include`). Most production reports carry the trust's ODS code only
+    on their ServiceRequest (requester.identifier), so without this most
+    of them came out "Unknown"; and a report coded only as e.g. SNOMED
+    "Genetic report" needs its order's R/M code to be categorised — an
+    earlier version only fetched for the missing-ODS case, so such a
+    report with its own ODS code stayed "Unclassified"."""
     index = FhirClient.index_orders(orders)
     missing = [
         r for r in reports
-        if not client.report_ordering_ods(r) and not client.match_report_order(r, index)
+        if (not client.report_ordering_ods(r) or FhirClient.report_category(r.get("code")) == "unclassified")
+        and not client.match_report_order(r, index)
     ]
     if missing:
         for key, order in FhirClient.index_orders(client.service_requests_for_reports(missing)).items():
@@ -2574,6 +2579,25 @@ MONTHLY_REPORTS_WINDOW_DAYS = 7
 MONTHLY_REPORTS_MAX_PAGES = 100
 
 
+def _code_signature(codeable_concept, missing):
+    """Short text describing what a CodeableConcept actually carries —
+    every coding as "system|code (display)", else its `.text`, else
+    `missing` — for the monthly report's "Unclassified reports" table."""
+    cc = codeable_concept or {}
+    codings = [
+        f"{c.get('system') or '(no system)'}|{c.get('code') or '(no code)'}"
+        + (f" ({c['display']})" if c.get("display") else "")
+        for c in cc.get("coding", [])
+    ]
+    if codings:
+        return "; ".join(codings)
+    return f"text only: {cc['text']}" if cc.get("text") else missing
+
+
+#: How many distinct code combinations the "Unclassified reports" table lists.
+UNCLASSIFIED_SIGNATURES_SHOWN = 25
+
+
 def _build_monthly_report():
     """
     Everything the monthly report shows, as the template context dict —
@@ -2623,6 +2647,9 @@ def _build_monthly_report():
     # ics -> month -> category -> count; ics -> trust -> month -> category -> count
     ics_counts, trust_counts = {}, {}
     ics_region_names = {}  # ICB name -> NHS region name, for ICBs seen in the data
+    # ICS -> (report code, order code) -> count, for unclassified reports —
+    # shows which codes need mapping (see _code_signature()).
+    unclassified_by_ics = {}
     truncated_months = []
     try:
         seen = set()
@@ -2656,6 +2683,13 @@ def _build_monthly_report():
                 trust_name = _org_name(org)
                 trust = _org_display_name(trust_name or ordering_ods, ordering_ods) if (trust_name or ordering_ods) else "Unknown"
                 category = FhirClient.report_category(r.get("code"), order.get("code") if order else None)
+                if category == "unclassified":
+                    signature = (
+                        _code_signature(r.get("code"), "(no code)"),
+                        _code_signature(order.get("code"), "(no code)") if order else "(no linked order found)",
+                    )
+                    sigs = unclassified_by_ics.setdefault(ics, {})
+                    sigs[signature] = sigs.get(signature, 0) + 1
                 by_cat = ics_counts.setdefault(ics, {}).setdefault(month, {})
                 by_cat[category] = by_cat.get(category, 0) + 1
                 by_cat = trust_counts.setdefault(ics, {}).setdefault(trust, {}).setdefault(month, {})
@@ -2720,6 +2754,13 @@ def _build_monthly_report():
 
     month_totals = [sum(r["months"][i] for r in ics_rows) for i in range(len(months))]
 
+    # Unclassified reports' code combinations over the ICS list above
+    # (region filter applied), most common first.
+    unclassified_signatures = {}
+    for ics in ics_list:
+        for signature, n in unclassified_by_ics.get(ics, {}).items():
+            unclassified_signatures[signature] = unclassified_signatures.get(signature, 0) + n
+
     # Category x month for the ICS list above (region filter applied,
     # category filter not — this table *is* the category breakdown).
     category_rows = []
@@ -2740,6 +2781,8 @@ def _build_monthly_report():
         ics_rows=ics_rows, month_totals=month_totals, category_rows=category_rows,
         category_month_totals=[sum(r["months"][i] for r in category_rows) for i in range(len(months))],
         truncated_months=truncated_months, max_pages=MONTHLY_REPORTS_MAX_PAGES,
+        unclassified_signatures=unclassified_signatures, unclassified_total=sum(unclassified_signatures.values()),
+        unclassified_shown=UNCLASSIFIED_SIGNATURES_SHOWN,
     )
 
 

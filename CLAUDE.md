@@ -1006,6 +1006,19 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   a resolved requester reference, and the ODS trust list's mixed-case
   name via an ODS code on the order), since rows group by name. Used by
   `_order_ordering()`/`_report_ordering()`, so daily stats gets it too.
+- **"Unclassified reports — what codes do they carry?"** — a collapsed
+  section under "Reports by category" listing the most common (report
+  code, order code) combinations among unclassified reports
+  (`_code_signature()`, top `UNCLASSIFIED_SIGNATURES_SHOWN`), region filter
+  applied. Every code in the IG's GenomicTestCode CodeSystem (2,130 R/M
+  codes) is categorised, so anything here is a code from another system
+  (SNOMED "Genetic report", iGene local codes, other LOINC, text only, ...)
+  — map it in `report_category()`/`LOINC_REPORT_CATEGORIES`. Not in the PDF.
+- **A report's ServiceRequest is fetched when it lacks an ODS code *or* a
+  categorisable code** (`_orders_index_for_reports()`) — originally only
+  the former, so a report coded only as SNOMED "Genetic report" but
+  carrying its own ODS code never got its order's R/M code and stayed
+  Unclassified.
 - **"Download as PDF"** (`/stats/monthly-reports/pdf`, same query string
   as the page) — `pdf_report.monthly_report_pdf_bytes()`, reportlab,
   landscape A4, same pattern as `/data-quality/pdf`. Both routes build

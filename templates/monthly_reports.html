@@ -69,6 +69,29 @@
       </table>
     </div>
 
+    {% if unclassified_total %}
+      <details style="margin: -.8rem 0 1.5rem;">
+        <summary class="muted" style="cursor: pointer;">
+          Unclassified reports ({{ unclassified_total }}) — what codes do they carry?
+        </summary>
+        <p class="muted">
+          Reports whose own code and originating order's code match none of the
+          recognised test codes (National Genomic Test Directory R/M codes, NW local
+          RX/MX/HX codes, Histotrac codes) or mapped LOINC codes. Most common
+          combinations first{% if unclassified_signatures|length > unclassified_shown %}
+          (top {{ unclassified_shown }} of {{ unclassified_signatures|length }}){% endif %}.
+        </p>
+        <div style="overflow-x: auto;">
+          <table>
+            <tr><th>Report code</th><th>Order code</th><th>Reports</th></tr>
+            {% for (report_code, order_code), n in (unclassified_signatures|dictsort(by='value', reverse=true))[:unclassified_shown] %}
+              <tr><td><code>{{ report_code }}</code></td><td><code>{{ order_code }}</code></td><td>{{ n }}</td></tr>
+            {% endfor %}
+          </table>
+        </div>
+      </details>
+    {% endif %}
+
     <h2>Reports by ICS{% if selected_region %} — {{ selected_region }}{% endif %}{% if selected_category_label %} — {{ selected_category_label }}{% endif %}</h2>
     <div style="overflow-x: auto;">
       <table>
