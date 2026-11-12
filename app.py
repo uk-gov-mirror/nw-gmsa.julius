@@ -2157,6 +2157,21 @@ def group_rows_by_organisation(rows):
     return [(org, groups[org]) for org in orgs]
 
 
+def _order_ordering(order):
+    """(requesting Organization resource or None, requesting organisation
+    name) for one ServiceRequest on the /stats screens — read off the
+    order itself (client.order_ordering_organisation(): requester
+    identifier, encounter or placer-number assigner ODS code), since
+    orders_in_range() no longer includes the requester chain. Only when
+    the order carries no ODS code at all does this fall back to resolving
+    the requester reference (order_organisation_resource() — one GET per
+    distinct requester, cached), so an order with a literal-only requester
+    still gets a name."""
+    org = client.order_ordering_organisation(order) or client.order_organisation_resource(order)
+    name = (org.get("name") if org else None) or client.order_organisation(order) or "Unknown"
+    return org, name
+
+
 def _report_ordering(report, orders_index):
     """(matched order or None, ordering Organization resource or None,
     ordering organisation name) for one DiagnosticReport on the /stats
@@ -2170,9 +2185,12 @@ def _report_ordering(report, orders_index):
     order's requesting organisation."""
     order = client.match_report_order(report, orders_index)
     org = client.report_ordering_organisation(report)
-    if not org and order:
-        org = client.order_organisation_resource(order)
-    name = (org.get("name") if org else None) or (client.order_organisation(order) if order else None) or "Unknown"
+    if org:
+        name = org.get("name") or "Unknown"
+    elif order:
+        org, name = _order_ordering(order)
+    else:
+        name = "Unknown"
     return order, org, name
 
 
@@ -2231,18 +2249,20 @@ def stats():
     try:
         orders = client.orders_in_range(start, end)
         order_rows = []
+        order_orgs = []
         for o in orders:
             patient = client.patient_for(o)
-            order_org_resource = client.order_organisation_resource(o)
+            order_org_resource, order_org_name = _order_ordering(o)
+            order_orgs.append((order_org_resource, order_org_name))
             order_rows.append({
                 "date": (o.get("authoredOn") or "")[:10] or "Unknown",
-                "organisation": client.order_organisation(o) or "Unknown",
+                "organisation": order_org_name,
                 "indication": client.order_indication(o),
                 "ics": client.organisation_ics(order_org_resource) or "Unknown",
                 "country": client.patient_country(patient) or "Unknown",
             })
 
-        org_geo = orders_by_organisation_geocoded(orders)
+        org_geo = organisations_geocoded(order_orgs)
         order_map_points = [g for g in org_geo if g["lat"] is not None and g["lon"] is not None]
         order_map_unmapped_count = sum(g["count"] for g in org_geo if g["lat"] is None)
 
@@ -2350,7 +2370,7 @@ def stats_organisation():
         matched_order_ids = set()
         order_test_rows, report_test_rows = [], []
         for o in orders:
-            if (client.order_organisation(o) or "Unknown") != org:
+            if _order_ordering(o)[1] != org:
                 continue
             matched_order_ids.add(o.get("id"))
             order_test_rows.append({"test": FhirClient.test_directory_code(o.get("code")) or "—"})
@@ -2423,7 +2443,7 @@ def stats_ics():
         matched_order_ids = set()
         order_test_rows, report_test_rows = [], []
         for o in orders:
-            order_ics = client.organisation_ics(client.order_organisation_resource(o)) or "Unknown"
+            order_ics = client.organisation_ics(_order_ordering(o)[0]) or "Unknown"
             if order_ics != ics:
                 continue
             matched_order_ids.add(o.get("id"))

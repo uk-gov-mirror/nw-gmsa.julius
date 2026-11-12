@@ -1377,20 +1377,21 @@ class FhirClient:
         """All genomic test orders authored within [start_date, end_date]
         (ISO dates), across all patients — used by the daily stats screen.
 
-        Bundles each order's patient and requester via `_include` (+
-        `_include:iterate` for the Practitioner/Organization behind a
-        PractitionerRole requester) and seeds the reference cache from
-        them (_cache_included()). app.stats() calls patient_for() and
-        order_organisation_resource() once per row; without this, every
-        one of those was a separate uncached resolve_reference() GET — an
-        N+1 that was slow enough to time the page out on a real week of
-        data. Same try-categorized-then-fall-back pattern used throughout
-        this file (see _active_orders_with_intent, _search_ctdna_service_requests)."""
+        Bundles each order's patient via `_include` (one hop) and seeds
+        the reference cache, so patient_for() per row is a cache hit.
+
+        **Deliberately no requester chain** — this used to also
+        `_include=ServiceRequest:requester` plus `_include:iterate` for the
+        Practitioner/Organization behind a PractitionerRole requester, the
+        same multi-hop shape that made reports_in_range() 413 on
+        production. The stats screens now read the requesting trust off
+        the order itself (order_ordering_organisation()). Same
+        try-categorized-then-fall-back pattern used throughout this file
+        (see _active_orders_with_intent, _search_ctdna_service_requests)."""
         params = {
             "authored": [f"ge{start_date}", f"le{end_date}"],
             "_count": 100,
-            "_include": ["ServiceRequest:patient", "ServiceRequest:requester"],
-            "_include:iterate": SERVICE_REQUEST_ITERATE_INCLUDES,
+            "_include": ["ServiceRequest:patient"],
         }
         try:
             matches, included = self._search_all_split(
@@ -1901,7 +1902,8 @@ class FhirClient:
                 org["name"] = org.get("name") or (self._ods_name_case(name) if name else ods_code)
                 if postcode and not self.organisation_postcode(org):
                     org["address"] = (org.get("address") or []) + [{"postalCode": postcode}]
-        self._org_by_ods_cache[ods_code] = org
+        if org:  # a miss may be a transient ODS API failure — retry next time
+            self._org_by_ods_cache[ods_code] = org
         return org
 
     @staticmethod
@@ -1911,6 +1913,45 @@ class FhirClient:
         "'s" lower case."""
         titled = re.sub(r"[A-Za-z]+('[A-Za-z]+)?", lambda m: m.group(0).capitalize(), name.lower())
         return re.sub(r"\b(Nhs|Gp|Icb|Uk)\b", lambda m: m.group(0).upper(), titled)
+
+    def order_ordering_ods(self, order):
+        """The requesting organisation's ODS code, read from the
+        ServiceRequest itself — no requester fetch/include:
+
+        1. `requester.identifier` — the IG's own ServiceRequest examples
+           put the requesting trust's ODS code here as a logical
+           identifier even when the requester is a PractitionerRole
+           (e.g. `{"type": "PractitionerRole", "identifier": {ods, "R0A"}}`).
+        2. `encounter.identifier.assigner`.
+        3. A PLAC-typed (placer order number) identifier's `assigner`.
+
+        2 and 3 skip the order's own `performer` ODS (the GLH/lab — the
+        IG's examples have the lab, 699X0, as the placer number's
+        assigner). None if nothing else is found."""
+        requester_ident = (order.get("requester") or {}).get("identifier") or {}
+        if requester_ident.get("value") and requester_ident.get("system") == self.ODS_ORGANIZATION_CODE_SYSTEM:
+            return requester_ident["value"]
+        performer_ods = {
+            ods for ods in (self.resolve_organisation_ods_inline(p) for p in order.get("performer", []))
+            if ods
+        }
+        candidates = [((order.get("encounter") or {}).get("identifier") or {}).get("assigner")]
+        for ident in order.get("identifier", []):
+            type_codes = [c.get("code") for c in (ident.get("type") or {}).get("coding", [])]
+            if self.PLACER_IDENTIFIER_TYPE in type_codes:
+                candidates.append(ident.get("assigner"))
+        for assigner in candidates:
+            ods = self.resolve_organisation_ods_inline(assigner)
+            if ods and ods not in performer_ods:
+                return ods
+        return None
+
+    def order_ordering_organisation(self, order):
+        """The requesting organisation for a ServiceRequest as an
+        Organization-shaped dict (organisation_by_ods() on
+        order_ordering_ods()), from the order alone — None if the order
+        doesn't say."""
+        return self.organisation_by_ods(self.order_ordering_ods(order))
 
     def report_ordering_organisation(self, report):
         """The ordering organisation for a DiagnosticReport as an
@@ -2079,18 +2120,24 @@ class FhirClient:
             return None
         if key in self._geocode_cache:
             return self._geocode_cache[key]
-        result = None
+        # Only a definite answer is cached (a result, or postcodes.io saying
+        # the postcode doesn't exist) — a timeout/5xx isn't, so a network
+        # blip is retried on the next request rather than leaving that
+        # organisation unmapped ("Unknown" ICS) for the process lifetime.
         try:
             resp = requests.get(
                 f"https://api.postcodes.io/postcodes/{quote(key)}", timeout=5,
             )
-            if resp.ok:
-                body = resp.json().get("result") or {}
-                lat, lon = body.get("latitude"), body.get("longitude")
-                if lat is not None and lon is not None:
-                    result = (lat, lon)
         except requests.RequestException:
-            result = None
+            return None
+        result = None
+        if resp.ok:
+            body = resp.json().get("result") or {}
+            lat, lon = body.get("latitude"), body.get("longitude")
+            if lat is not None and lon is not None:
+                result = (lat, lon)
+        elif resp.status_code not in (400, 404):
+            return None
         self._geocode_cache[key] = result
         return result
 
@@ -2217,7 +2264,10 @@ class FhirClient:
             return self._org_ics_cache[key]
         geocode = self.organisation_geocode(organisation)
         result = self.icb_for_coordinates(geocode[0], geocode[1]) if geocode else None
-        if key:
+        # Not cached when geocoding came back empty for an organisation
+        # that does have a postcode — that may be a transient postcodes.io
+        # failure (geocode_postcode() caches definite answers itself).
+        if key and (result or not self.organisation_postcode(organisation)):
             self._org_ics_cache[key] = result
         return result
 

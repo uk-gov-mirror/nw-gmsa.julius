@@ -818,9 +818,17 @@ Queries `ServiceRequest`/`DiagnosticReport` system-wide for a date range
 `max_pages` if a high-volume range silently hits the cap). Breaks results down
 by day, organisation, indication, ICS, and country.
 
-- **`orders_in_range()` bundles patient/requester (+ `_include:iterate`
-  for a PractitionerRole requester); `reports_in_range()` bundles only
-  patient/performer — one hop, and deliberately no ServiceRequest.** Both
+- **`orders_in_range()` bundles only patient; `reports_in_range()` only
+  patient/performer — one hop each, deliberately no requester chain and
+  no ServiceRequest.** `orders_in_range()` used to `_include` the
+  requester + `_include:iterate` PractitionerRole's
+  Practitioner/Organization; the requesting trust now comes off the order
+  itself (`app._order_ordering()` → `order_ordering_organisation()`:
+  `requester.identifier` ODS — where the IG's own ServiceRequest examples
+  put it, even for a PractitionerRole requester — else encounter/placer
+  number assigner), falling back to resolving the requester reference
+  (one cached GET per distinct requester) only when the order carries
+  no ODS code at all. Both
   seed the reference cache (`_cache_included()`). `reports_in_range()`
   used to also `_include=DiagnosticReport:based-on` + the order's
   requester chain, which **413'd on production** (a month of reports;
