@@ -22,6 +22,7 @@ not guesses:
 import os
 import csv
 import io
+import json
 import re
 import time
 import base64
@@ -85,7 +86,9 @@ class FhirClient:
         self.verify_ssl = verify_ssl
         self._ref_cache = {}  # reference string -> resolved resource (or None); process-lifetime only
         self._geocode_cache = {}  # normalized postcode -> (lat, lon) or None; process-lifetime only
-        self._org_by_ods_cache = {}  # ODS code -> Organization-shaped dict (or None); process-lifetime only
+        self._org_by_ods_cache = {}  # ODS code -> Organization-shaped dict; process-lifetime only
+        self._org_by_ods_misses = {}  # ODS code -> time of last failed lookup (see ODS_RETRY_AFTER_SECONDS)
+        self.last_search_truncated = False  # see _search_all_split()
 
     def _auth(self):
         return HTTPBasicAuth(self.user, self.password) if self.user else None
@@ -335,6 +338,12 @@ class FhirClient:
         independently of the fallback-filter fix above — subsequent
         pages are followed via Bundle.link[rel=next] URLs, which already
         bake in whatever params the first page's request succeeded with.
+
+        Sets `self.last_search_truncated` — True if it stopped at
+        `max_pages` with a next page still to fetch. Callers that warn
+        about a cap should check this rather than comparing the result
+        count to max_pages * _count: `_count` may have been halved by
+        _get_with_count_backoff(), so a capped result can be far smaller.
         """
         request_params = dict(params)
         if set(request_params) <= {"_count"}:
@@ -357,6 +366,7 @@ class FhirClient:
             all_matches.extend(matches)
             all_included.extend(included)
             pages += 1
+        self.last_search_truncated = any(l.get("relation") == "next" for l in bundle.get("link", []))
         return all_matches, all_included
 
     def _search_all(self, resource_type, params, max_pages=10):
@@ -1886,13 +1896,19 @@ class FhirClient:
             return None
         if ods_code in self._org_by_ods_cache:
             return self._org_by_ods_cache[ods_code]
-        trust = self.ods_trusts().get(ods_code)
+        missed_at = self._org_by_ods_misses.get(ods_code)
+        if missed_at and time.time() - missed_at < self.ODS_RETRY_AFTER_SECONDS:
+            return None
+        trusts = self.ods_trusts()
+        # A trust *site* code ("R0A07") is counted under its parent trust
+        # ("R0A") — the stats screens break down by NHS trust.
+        trust = trusts.get(ods_code) or (trusts.get(ods_code[:3]) if len(ods_code) > 3 else None)
         if trust:
             # An NHS trust: ODS's own trust list already has name and
             # postcode — no FHIR or ODS API call needed.
             org = {
-                "resourceType": "Organization", "id": f"ods-{ods_code}", "name": self._ods_name_case(trust["name"]),
-                "identifier": [{"system": self.ODS_ORGANIZATION_CODE_SYSTEM, "value": ods_code}],
+                "resourceType": "Organization", "id": f"ods-{trust['code']}", "name": self._ods_name_case(trust["name"]),
+                "identifier": [{"system": self.ODS_ORGANIZATION_CODE_SYSTEM, "value": trust["code"]}],
                 "address": [{"postalCode": trust["postcode"]}] if trust["postcode"] else [],
             }
             self._org_by_ods_cache[ods_code] = org
@@ -1912,8 +1928,12 @@ class FhirClient:
                 org["name"] = org.get("name") or (self._ods_name_case(name) if name else ods_code)
                 if postcode and not self.organisation_postcode(org):
                     org["address"] = (org.get("address") or []) + [{"postalCode": postcode}]
-        if org:  # a miss may be a transient ODS API failure — retry next time
+        if org:
             self._org_by_ods_cache[ods_code] = org
+        else:
+            # A miss may be a transient ODS API failure, so it isn't cached
+            # for good — but not retried for every report either.
+            self._org_by_ods_misses[ods_code] = time.time()
         return org
 
     @staticmethod
@@ -1987,6 +2007,59 @@ class FhirClient:
                     index.setdefault(f"{ident.get('system')}|{ident['value']}", o)
                     index.setdefault(ident["value"], o)
         return index
+
+    #: How many ids/identifiers go into one batched ServiceRequest search
+    #: (service_requests_for_reports()) — keeps each URL and result set
+    #: small.
+    SERVICE_REQUEST_BATCH_SIZE = 50
+
+    def service_requests_for_reports(self, reports):
+        """The originating ServiceRequests of `reports`, fetched in
+        batches — `ServiceRequest?_id=a,b,c,...` for literal `basedOn`
+        references and `ServiceRequest?identifier=sys|v1,sys|v2,...` for
+        logical ones — with **no `_include`**, rather than per-report GETs
+        or reports_in_range()'s old `_include=DiagnosticReport:based-on`
+        (which 413'd on production). Each fetched order is seeded into the
+        reference cache under "ServiceRequest/<id>", so a later
+        resolve_reference()/order_for_report() is a cache hit. A batch
+        that fails is skipped (its reports just stay unmatched) rather
+        than failing the whole page."""
+        ids, identifiers = set(), set()
+        for r in reports:
+            for ref in r.get("basedOn", []):
+                literal = ref.get("reference") or ""
+                if "ServiceRequest/" in literal:
+                    sr_id = literal.split("ServiceRequest/")[-1].split("/")[0]
+                    if f"ServiceRequest/{sr_id}" not in self._ref_cache:
+                        ids.add(sr_id)
+                    continue
+                ident = ref.get("identifier") or {}
+                if ident.get("value") and "," not in ident["value"]:
+                    identifiers.add(f"{ident['system']}|{ident['value']}" if ident.get("system") else ident["value"])
+
+        found = {}
+        size = self.SERVICE_REQUEST_BATCH_SIZE
+        for param, values in (("_id", sorted(ids)), ("identifier", sorted(identifiers))):
+            for start in range(0, len(values), size):
+                chunk = values[start:start + size]
+                try:
+                    orders = self._search_all("ServiceRequest", {param: ",".join(chunk), "_count": 100})
+                except requests.HTTPError:
+                    continue
+                for o in orders:
+                    if o.get("resourceType") == "ServiceRequest" and o.get("id"):
+                        key = f"ServiceRequest/{o['id']}"
+                        self._ref_cache[key] = o
+                        found[key] = o
+        # Orders already cached from an earlier call count too.
+        for r in reports:
+            for ref in r.get("basedOn", []):
+                literal = ref.get("reference") or ""
+                if "ServiceRequest/" in literal:
+                    key = "ServiceRequest/" + literal.split("ServiceRequest/")[-1].split("/")[0]
+                    if self._ref_cache.get(key):
+                        found[key] = self._ref_cache[key]
+        return list(found.values())
 
     @staticmethod
     def match_report_order(report, orders_index):
@@ -2219,6 +2292,20 @@ class FhirClient:
     #: "Data search and export" host as ECONCUR_CSV_URL.
     ODS_TRUSTS_REPORT_URL = "https://www.odsdatasearchandexport.nhs.uk/api/getReport?report=etr"
 
+    #: Bundled copies of that export and of every ICB code's name, written
+    #: by scripts/update_ods_reference_data.py and committed — read first,
+    #: so ICS/region work with no outbound internet access from wherever
+    #: the app runs. Only if a file is missing does the app download.
+    ODS_REFERENCE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ods")
+    ODS_TRUSTS_FILE = os.path.join(ODS_REFERENCE_DATA_DIR, "etr.csv")
+    ODS_ICB_NAMES_FILE = os.path.join(ODS_REFERENCE_DATA_DIR, "icb_names.json")
+
+    #: After a failed download, how long (seconds) before trying again —
+    #: without this, a server that can't reach ODS retried the download
+    #: once per report, which is both slow and a good way to get throttled.
+    ODS_RETRY_AFTER_SECONDS = 300
+    _ods_trusts_failed_at = None
+
     #: NHS England region ODS codes (etr.csv column [2]) — stable, so
     #: hardcoded rather than looked up.
     NHS_REGION_NAMES = {
@@ -2235,7 +2322,7 @@ class FhirClient:
     #: login): ODS code -> trust row dict, and ICB code -> ICB name. A
     #: failed fetch is not cached, same as fetch_icb_boundaries().
     _ods_trusts_cache = None
-    _icb_name_cache = {}
+    _icb_name_cache = None
 
     @classmethod
     def ods_trusts(cls):
@@ -2247,13 +2334,22 @@ class FhirClient:
         rather than failing."""
         if cls._ods_trusts_cache is not None:
             return cls._ods_trusts_cache
-        try:
-            resp = requests.get(cls.ODS_TRUSTS_REPORT_URL, timeout=60)
-            resp.raise_for_status()
-        except requests.RequestException:
-            return {}
+        text = None
+        if os.path.exists(cls.ODS_TRUSTS_FILE):
+            with open(cls.ODS_TRUSTS_FILE, encoding="utf-8") as f:
+                text = f.read()
+        else:
+            if cls._ods_trusts_failed_at and time.time() - cls._ods_trusts_failed_at < cls.ODS_RETRY_AFTER_SECONDS:
+                return {}
+            try:
+                resp = requests.get(cls.ODS_TRUSTS_REPORT_URL, timeout=60)
+                resp.raise_for_status()
+                text = resp.text
+            except requests.RequestException:
+                cls._ods_trusts_failed_at = time.time()
+                return {}
         trusts = {}
-        for row in csv.reader(io.StringIO(resp.text)):
+        for row in csv.reader(io.StringIO(text)):
             if len(row) < 12 or not row[0]:
                 continue
             trusts[row[0]] = {
@@ -2274,6 +2370,11 @@ class FhirClient:
         fails (not cached, so it's retried)."""
         if not icb_code:
             return None
+        if cls._icb_name_cache is None:
+            cls._icb_name_cache = {}
+            if os.path.exists(cls.ODS_ICB_NAMES_FILE):
+                with open(cls.ODS_ICB_NAMES_FILE, encoding="utf-8") as f:
+                    cls._icb_name_cache.update(json.load(f))
         if icb_code in cls._icb_name_cache:
             return cls._icb_name_cache[icb_code]
         name, _ = cls.ods_lookup(icb_code)

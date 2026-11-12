@@ -2178,11 +2178,12 @@ def _report_ordering(report, orders_index):
     screens — without fetching the report's ServiceRequest (that
     `_include` 413'd on production; see reports_in_range()).
 
-    The order is only the one already in `orders_index` (index_orders()
-    over orders_in_range()'s result — client.match_report_order()). The
-    organisation comes off the report itself
-    (client.report_ordering_organisation()), falling back to the matched
-    order's requesting organisation."""
+    The order is only one already in `orders_index`
+    (_orders_index_for_reports(): the in-range orders plus a batched fetch
+    of the ServiceRequests of reports with no ODS code of their own —
+    client.match_report_order()). The organisation comes off the report
+    itself (client.report_ordering_organisation()), falling back to the
+    matched order's requesting organisation (_order_ordering())."""
     order = client.match_report_order(report, orders_index)
     org = client.report_ordering_organisation(report)
     if org:
@@ -2192,6 +2193,25 @@ def _report_ordering(report, orders_index):
     else:
         name = "Unknown"
     return order, org, name
+
+
+def _orders_index_for_reports(reports, orders=()):
+    """index_orders() over `orders` (e.g. orders_in_range()'s, possibly
+    none) plus the originating ServiceRequests of every report that has
+    no ordering ODS code of its own and whose order isn't already in
+    `orders` — fetched in batches by client.service_requests_for_reports()
+    (`_id=a,b,c,...`, no `_include`). Most production reports carry the
+    trust's ODS code only on their ServiceRequest (requester.identifier),
+    so without this most of them came out "Unknown"."""
+    index = FhirClient.index_orders(orders)
+    missing = [
+        r for r in reports
+        if not client.report_ordering_ods(r) and not client.match_report_order(r, index)
+    ]
+    if missing:
+        for key, order in FhirClient.index_orders(client.service_requests_for_reports(missing)).items():
+            index.setdefault(key, order)
+    return index
 
 
 def _reports_by_order_id(reports, orders_index):
@@ -2269,7 +2289,7 @@ def stats():
         order_ics_map_html, order_ics_map_unmatched_count, order_ics_map_unmatched_names = ics_choropleth_html(group_count(order_rows, "ics"))
 
         reports = client.reports_in_range(start, end)
-        orders_index = FhirClient.index_orders(orders)
+        orders_index = _orders_index_for_reports(reports, orders)
         report_rows = []
         report_orgs = []
         for r in reports:
@@ -2364,7 +2384,7 @@ def stats_organisation():
         orders = client.orders_in_range(start, end)
         reports = client.reports_in_range(start, end)
 
-        orders_index = FhirClient.index_orders(orders)
+        orders_index = _orders_index_for_reports(reports, orders)
         report_by_order_id = _reports_by_order_id(reports, orders_index)
 
         matched_order_ids = set()
@@ -2437,7 +2457,7 @@ def stats_ics():
         orders = client.orders_in_range(start, end)
         reports = client.reports_in_range(start, end)
 
-        orders_index = FhirClient.index_orders(orders)
+        orders_index = _orders_index_for_reports(reports, orders)
         report_by_order_id = _reports_by_order_id(reports, orders_index)
 
         matched_order_ids = set()
@@ -2496,9 +2516,13 @@ def _month_range(start_month, end_month):
 #: Upper bound on how many months /stats/monthly-reports will query in one
 #: go — each month is its own reports_in_range() search.
 MONTHLY_REPORTS_MAX_MONTHS = 24
-#: Pages (of 100) fetched per month — a month whose report count reaches
-#: this many pages is flagged as possibly truncated.
-MONTHLY_REPORTS_MAX_PAGES = 20
+#: Each month is searched in windows of this many days, each with its own
+#: page cap — one search for a whole busy month hit the cap on production.
+MONTHLY_REPORTS_WINDOW_DAYS = 7
+#: Pages fetched per window — up to 10,000 reports a week at _count=100
+#: (raised from 20 / 2,000). A window that still had pages left flags its
+#: month as incomplete (client.last_search_truncated).
+MONTHLY_REPORTS_MAX_PAGES = 100
 
 
 @app.route("/stats/monthly-reports")
@@ -2508,19 +2532,20 @@ def monthly_reports():
     only; the current month can be picked too, counted up to today), by ICS and report category, filterable by NHS region and
     category, with each ICS expandable into its NHS trusts.
 
-    Uses the DiagnosticReport alone — no ServiceRequest (an
-    `_include=DiagnosticReport:based-on` chain made a month's search 413 on
-    production). The trust is the ordering organisation's ODS code read off
-    the report (client.report_ordering_ods(): encounter identifier
-    assigner, else placer-number assigner), named via
-    client.organisation_by_ods(); its ICS and NHS region come from ODS's
-    own trust -> ICB mapping (FhirClient.trust_geography()), not a
-    postcode lookup. Category is FhirClient.report_category() on the
+    The report search has no `_include` (an `_include=DiagnosticReport:
+    based-on` chain made a month's search 413 on production) and runs in
+    week-sized windows (MONTHLY_REPORTS_WINDOW_DAYS). The trust is the
+    ordering organisation's ODS code — off the report itself where it
+    carries one (client.report_ordering_ods()), otherwise off its
+    ServiceRequest, fetched in id batches without includes
+    (_orders_index_for_reports() / _report_ordering()). Its ICS and NHS
+    region come from ODS's trust -> ICB mapping
+    (FhirClient.trust_geography()). Category is FhirClient.report_category() on the
     report's own code.
 
-    Queried one month at a time (reports_in_range() per month) rather than
-    one big range, so each search stays bounded — see "413s on unfiltered
-    system-wide searches" in CLAUDE.md.
+    Queried one week-sized window at a time rather than one big range, so
+    each search stays bounded — see "413s on unfiltered system-wide
+    searches" in CLAUDE.md.
     """
     today = date.today()
     this_month = today.strftime("%Y-%m")
@@ -2554,22 +2579,31 @@ def monthly_reports():
             month_start = date(y, m, 1)
             month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
             month_end = min(month_end, today)
-            reports = client.reports_in_range(month_start.isoformat(), month_end.isoformat(),
-                                              max_pages=MONTHLY_REPORTS_MAX_PAGES, with_includes=False)
-            if len(reports) >= MONTHLY_REPORTS_MAX_PAGES * 100:
-                truncated_months.append(month)
+            # Week-sized windows rather than one search per month — a busy
+            # month has more reports than one search's page cap, and each
+            # window gets its own cap.
+            reports = []
+            window_start = month_start
+            while window_start <= month_end:
+                window_end = min(window_start + timedelta(days=MONTHLY_REPORTS_WINDOW_DAYS - 1), month_end)
+                window = client.reports_in_range(window_start.isoformat(), window_end.isoformat(),
+                                                 max_pages=MONTHLY_REPORTS_MAX_PAGES, with_includes=False)
+                if client.last_search_truncated and month not in truncated_months:
+                    truncated_months.append(month)
+                reports.extend(window)
+                window_start = window_end + timedelta(days=1)
+            reports = [r for r in reports if r.get("id") not in seen and not seen.add(r.get("id"))]
+            orders_index = _orders_index_for_reports(reports)
             for r in reports:
-                if r.get("id") in seen:
-                    continue
-                seen.add(r.get("id"))
-                ordering_ods = client.report_ordering_ods(r)
-                org = client.organisation_by_ods(ordering_ods)
+                order, org, _ = _report_ordering(r, orders_index)
+                ordering_ods = client.organisation_ods_code(org) if org else None
                 geo = FhirClient.trust_geography(ordering_ods)
                 ics = geo["icb_name"] if geo else "Unknown"
                 if geo:
                     ics_region_names[ics] = geo["region_name"]
-                trust = _org_display_name(org.get("name") or ordering_ods, ordering_ods) if org else (ordering_ods or "Unknown")
-                category = FhirClient.report_category(r.get("code"))
+                trust_name = org.get("name") if org else None
+                trust = _org_display_name(trust_name or ordering_ods, ordering_ods) if (trust_name or ordering_ods) else "Unknown"
+                category = FhirClient.report_category(r.get("code"), order.get("code") if order else None)
                 by_cat = ics_counts.setdefault(ics, {}).setdefault(month, {})
                 by_cat[category] = by_cat.get(category, 0) + 1
                 by_cat = trust_counts.setdefault(ics, {}).setdefault(trust, {}).setdefault(month, {})
@@ -2638,7 +2672,7 @@ def monthly_reports():
         categories=FhirClient.REPORT_CATEGORIES, selected_category=selected_category,
         selected_category_label=category_labels.get(selected_category),
         ics_rows=ics_rows, month_totals=month_totals, category_rows=category_rows,
-        truncated_months=truncated_months,
+        truncated_months=truncated_months, max_pages=MONTHLY_REPORTS_MAX_PAGES,
     )
 
 

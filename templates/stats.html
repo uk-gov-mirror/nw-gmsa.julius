@@ -132,9 +132,10 @@
 
 <h2>Reports by ordering provider</h2>
 <p class="muted">
-    The organisation that <em>ordered</em> the test (read off the report
-    itself — its encounter or placer order number's assigning
-    organisation — not its <code>ServiceRequest</code>), as opposed to "Reports by
+    The organisation that <em>ordered</em> the test — the ODS code on the
+    report itself (its encounter or placer order number) where it has one,
+    otherwise on its originating <code>ServiceRequest</code> (fetched in
+    batches) — as opposed to "Reports by
     performing organisation" above (the lab that produced the report).
 </p>
 {% if report_map_points %}

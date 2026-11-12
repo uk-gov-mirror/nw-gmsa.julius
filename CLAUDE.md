@@ -965,14 +965,26 @@ Management Reports. Queried **one month at a time** (`reports_in_range(...,
 max_pages=MONTHLY_REPORTS_MAX_PAGES)`), so each search stays bounded; a
 month that hits the page cap is flagged on the page as possibly incomplete.
 
-- **DiagnosticReport only — no ServiceRequest, no `_include` at all**
-  (`reports_in_range(..., with_includes=False)`). The original version
-  `_include`d `DiagnosticReport:based-on` + the requester chain and 413'd
-  on production for a single month. The ordering trust's ODS code is read
-  off the report itself (`report_ordering_ods()`:
+- **No `_include` on the report search** (`reports_in_range(...,
+  with_includes=False)`) — the original `_include`d
+  `DiagnosticReport:based-on` + the requester chain and 413'd on
+  production for a single month. **Searched in week-sized windows**
+  (`MONTHLY_REPORTS_WINDOW_DAYS` = 7, each with its own
+  `MONTHLY_REPORTS_MAX_PAGES` = 100 page cap, i.e. 10,000 reports/week at
+  `_count=100`) — one 20-page search per month hit the cap (2,000) on
+  production for October 2026. The "may be incomplete" warning comes from
+  `FhirClient.last_search_truncated` (set by `_search_all_split()` when it
+  stops with a next page left), not from the result count — `_count` can
+  be halved by the 413 backoff, so a count check would miss it. The ordering trust's ODS code
+  is read off the report itself where it has one (`report_ordering_ods()`:
   `encounter.identifier.assigner`, else the PLAC-typed
   `basedOn.identifier.assigner`, skipping the report's own performer —
-  the GLH, e.g. `699X0`), then `organisation_by_ods()` names it (ODS's
+  the GLH, e.g. `699X0`); **on production most reports don't**, so for
+  the rest their ServiceRequests are fetched in batches
+  (`app._orders_index_for_reports()` → `FhirClient.service_requests_for_reports()`:
+  `ServiceRequest?_id=a,b,c,...` / `identifier=...`, 50 per search, no
+  `_include`, seeded into the reference cache) and the code read off the
+  order (`order_ordering_ods()`: `requester.identifier`). Then `organisation_by_ods()` names it (ODS's
   trust list for an NHS trust, else this server's Organization topped up
   from the NHS ODS API), and the ICS/region come from ODS's trust → ICB
   mapping (`FhirClient.trust_geography()`, see "ICS from the ODS trust →
@@ -1003,14 +1015,21 @@ month that hits the page cap is flagged on the page as possibly incomplete.
 Every "by ICS" breakdown (`/stats` tables, choropleths and `/stats/ics`
 drill-down, `/stats/monthly-reports`) gets an organisation's ICS from
 **NHS ODS's own trust → ICB mapping**, by ODS code — not from its
-postcode. `FhirClient.ods_trusts()` downloads ODS's `etr.csv` NHS Trusts
-export once per process (`ODS_TRUSTS_REPORT_URL`, ~60KB; columns: code,
-name, region `Yxx`, ICB code, ..., postcode, close date);
-`trust_geography(ods)` returns ICB code/name and region (a 5-character
-site code falls back to its 3-character parent trust); `icb_name()`
-names an ICB code via the NHS ODS lookup API (cached), so merged/renamed
-ICBs come through with their current names. `organisation_ics(org)` is
-just `trust_geography(organisation_ods_code(org))`.
+postcode. **The data is bundled in the repo** — `data/ods/etr.csv`
+(ODS's NHS Trusts export; columns: code, name, region `Yxx`, ICB code,
+..., postcode, close date) and `data/ods/icb_names.json` (ICB code →
+name), written by `scripts/update_ods_reference_data.py` (re-run and
+commit when trusts/ICBs change) — so the app needs **no outbound internet
+access** for this; `FhirClient.ods_trusts()`/`icb_name()` only download
+(`ODS_TRUSTS_REPORT_URL` / the ODS lookup API) if a file is missing, and
+after a failed download wait `ODS_RETRY_AFTER_SECONDS` before retrying
+rather than retrying per report (the likely reason a production run put
+R0A under "Unknown" — not confirmed, but a failed download there left
+every trust without an ICS and was retried for every report). `trust_geography(ods)` returns ICB code/name and region;
+`organisation_by_ods()` names a trust from the same file. A 5-character
+site code ("R0A07") counts under its 3-character parent trust ("R0A") in
+both. `organisation_ics(org)` is just
+`trust_geography(organisation_ods_code(org))`.
 
 - This **replaced** postcode → postcodes.io → point-in-polygon against
   the ONS ICB boundaries (`icb_for_coordinates()`, removed). postcodes.io

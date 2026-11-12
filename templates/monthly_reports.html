@@ -36,7 +36,8 @@
   {% endif %}
   {% if truncated_months %}
     <div class="error">
-      Hit the per-month fetch limit for {{ truncated_months|join(", ") }} — counts for
+      Hit the fetch limit (searched a week at a time, up to {{ max_pages }} pages per week) for
+      {{ truncated_months|join(", ") }} — counts for
       {{ "that month" if truncated_months|length == 1 else "those months" }} may be incomplete.
     </div>
   {% endif %}
