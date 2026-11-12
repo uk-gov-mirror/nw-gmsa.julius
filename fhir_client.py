@@ -85,7 +85,6 @@ class FhirClient:
         self.verify_ssl = verify_ssl
         self._ref_cache = {}  # reference string -> resolved resource (or None); process-lifetime only
         self._geocode_cache = {}  # normalized postcode -> (lat, lon) or None; process-lifetime only
-        self._org_ics_cache = {}  # Organization.id -> ICB23NM name (or None); process-lifetime only
         self._org_by_ods_cache = {}  # ODS code -> Organization-shaped dict (or None); process-lifetime only
 
     def _auth(self):
@@ -1887,6 +1886,17 @@ class FhirClient:
             return None
         if ods_code in self._org_by_ods_cache:
             return self._org_by_ods_cache[ods_code]
+        trust = self.ods_trusts().get(ods_code)
+        if trust:
+            # An NHS trust: ODS's own trust list already has name and
+            # postcode — no FHIR or ODS API call needed.
+            org = {
+                "resourceType": "Organization", "id": f"ods-{ods_code}", "name": self._ods_name_case(trust["name"]),
+                "identifier": [{"system": self.ODS_ORGANIZATION_CODE_SYSTEM, "value": ods_code}],
+                "address": [{"postalCode": trust["postcode"]}] if trust["postcode"] else [],
+            }
+            self._org_by_ods_cache[ods_code] = org
+            return org
         try:
             matches = self.search_organizations(ods_code=ods_code)
         except requests.HTTPError:
@@ -1912,7 +1922,10 @@ class FhirClient:
         TRUST") as readable title case, keeping NHS/GP/ICB upper case and
         "'s" lower case."""
         titled = re.sub(r"[A-Za-z]+('[A-Za-z]+)?", lambda m: m.group(0).capitalize(), name.lower())
-        return re.sub(r"\b(Nhs|Gp|Icb|Uk)\b", lambda m: m.group(0).upper(), titled)
+        titled = re.sub(r"\b(Nhs|Gp|Icb|Uk)\b", lambda m: m.group(0).upper(), titled)
+        # "Cheshire and Merseyside", "Cornwall and the Isles of Scilly" —
+        # small words lower case except as the first word.
+        return re.sub(r"(?<=\s)(And|Of|The|On|In|For|At|By|Upon)\b", lambda m: m.group(0).lower(), titled)
 
     def order_ordering_ods(self, order):
         """The requesting organisation's ODS code, read from the
@@ -2197,79 +2210,124 @@ class FhirClient:
             pass
         return cls._icb_boundary_cache
 
-    @staticmethod
-    def _point_in_ring(lon, lat, ring):
-        """Ray-casting point-in-polygon test for a single GeoJSON linear
-        ring ([lon, lat] pairs) — standard even-odd crossing count, no
-        external geometry library needed for the one shape test
-        icb_for_coordinates() below requires."""
-        inside = False
-        j = len(ring) - 1
-        for i in range(len(ring)):
-            xi, yi = ring[i][0], ring[i][1]
-            xj, yj = ring[j][0], ring[j][1]
-            if ((yi > lat) != (yj > lat)) and (
-                lon < (xj - xi) * (lat - yi) / (yj - yi) + xi
-            ):
-                inside = not inside
-            j = i
-        return inside
+    #: NHS ODS "NHS Trusts" export (etr.csv, no header row) — one row per
+    #: trust: [0] ODS code, [1] name, [2] NHS England region code ("Y62"),
+    #: [3] ICB code ("QOP" — the trust's "high level health geography"),
+    #: [9] postcode, [11] close date (blank if open). The authoritative
+    #: trust -> ICB -> region mapping, replacing the old postcode ->
+    #: postcodes.io -> ONS-boundary point-in-polygon lookup. Same ODS
+    #: "Data search and export" host as ECONCUR_CSV_URL.
+    ODS_TRUSTS_REPORT_URL = "https://www.odsdatasearchandexport.nhs.uk/api/getReport?report=etr"
+
+    #: NHS England region ODS codes (etr.csv column [2]) — stable, so
+    #: hardcoded rather than looked up.
+    NHS_REGION_NAMES = {
+        "Y63": "North East and Yorkshire",
+        "Y62": "North West",
+        "Y60": "Midlands",
+        "Y61": "East of England",
+        "Y56": "London",
+        "Y59": "South East",
+        "Y58": "South West",
+    }
+
+    #: Class-level caches (static reference data, not tied to a server or
+    #: login): ODS code -> trust row dict, and ICB code -> ICB name. A
+    #: failed fetch is not cached, same as fetch_icb_boundaries().
+    _ods_trusts_cache = None
+    _icb_name_cache = {}
 
     @classmethod
-    def _point_in_geometry(cls, lon, lat, geometry):
-        """True if (lon, lat) falls inside a GeoJSON Polygon/MultiPolygon
-        geometry — outer ring must contain the point and no hole (any ring
-        after the first) may."""
-        gtype = geometry.get("type")
-        coords = geometry.get("coordinates") or []
-        polygons = coords if gtype == "MultiPolygon" else [coords] if gtype == "Polygon" else []
-        for polygon in polygons:
-            if not polygon or not cls._point_in_ring(lon, lat, polygon[0]):
+    def ods_trusts(cls):
+        """{ODS code: {"code", "name", "region_code", "icb_code",
+        "postcode", "closed"}} for every NHS trust in ODS's etr.csv (see
+        ODS_TRUSTS_REPORT_URL) — open and closed, since a report can come
+        from a trust that's since merged. Downloaded once per process
+        (~60KB); {} if it can't be fetched, so callers degrade to "Unknown"
+        rather than failing."""
+        if cls._ods_trusts_cache is not None:
+            return cls._ods_trusts_cache
+        try:
+            resp = requests.get(cls.ODS_TRUSTS_REPORT_URL, timeout=60)
+            resp.raise_for_status()
+        except requests.RequestException:
+            return {}
+        trusts = {}
+        for row in csv.reader(io.StringIO(resp.text)):
+            if len(row) < 12 or not row[0]:
                 continue
-            if any(cls._point_in_ring(lon, lat, hole) for hole in polygon[1:]):
-                continue
-            return True
-        return False
+            trusts[row[0]] = {
+                "code": row[0], "name": row[1], "region_code": row[2], "icb_code": row[3],
+                "postcode": row[9], "closed": bool(row[11]),
+            }
+        if trusts:
+            cls._ods_trusts_cache = trusts
+        return trusts
 
     @classmethod
-    def icb_for_coordinates(cls, lat, lon):
-        """Official ICB name (ICB23NM) whose boundary polygon
-        (fetch_icb_boundaries()) contains (lat, lon), via a simple
-        point-in-polygon test — or None if boundary data couldn't be
-        fetched, or the point doesn't fall inside any ICB polygon (e.g.
-        outside England/Wales, or just off a coastal/boundary edge)."""
-        boundaries = cls.fetch_icb_boundaries()
-        if not boundaries:
+    def icb_name(cls, icb_code):
+        """Readable ICB name for an ODS ICB code ("QOP" -> "NHS Greater
+        Manchester Integrated Care Board"), via the NHS ODS lookup API —
+        dynamic rather than a hardcoded list, since ICBs merge (six new
+        ones on 2025-11-13, e.g. "NHS Central East Integrated Care Board",
+        S1Y5D). Cached per code; falls back to the bare code if the lookup
+        fails (not cached, so it's retried)."""
+        if not icb_code:
             return None
-        for feature in boundaries.get("features", []):
-            if cls._point_in_geometry(lon, lat, feature.get("geometry") or {}):
-                return feature.get("properties", {}).get("ICB23NM")
-        return None
+        if icb_code in cls._icb_name_cache:
+            return cls._icb_name_cache[icb_code]
+        name, _ = cls.ods_lookup(icb_code)
+        if not name:
+            return icb_code
+        cls._icb_name_cache[icb_code] = cls._ods_name_case(name)
+        return cls._icb_name_cache[icb_code]
+
+    @classmethod
+    def trust_geography(cls, ods_code):
+        """{"icb_code", "icb_name", "region_code", "region_name"} for an
+        organisation's ODS code, from ods_trusts() — or None if it isn't an
+        NHS trust ODS knows about (a GP practice, private provider, ...).
+        A 5-character trust *site* code ("R0A07") falls back to its parent
+        trust (the first 3 characters, "R0A"), since site codes are built
+        on the trust's own code."""
+        if not ods_code:
+            return None
+        trusts = cls.ods_trusts()
+        trust = trusts.get(ods_code) or (trusts.get(ods_code[:3]) if len(ods_code) > 3 else None)
+        if not trust or not trust["icb_code"]:
+            return None
+        return {
+            "icb_code": trust["icb_code"],
+            "icb_name": cls.icb_name(trust["icb_code"]),
+            "region_code": trust["region_code"],
+            "region_name": cls.NHS_REGION_NAMES.get(trust["region_code"]),
+        }
+
+    @classmethod
+    def icbs_by_region(cls):
+        """{region name: [ICB name, ...]} over every *open* trust's ICB in
+        ods_trusts(), regions in NHS_REGION_NAMES order and ICBs sorted —
+        the current ICB list per region, derived from ODS rather than
+        hardcoded. {} if the trust list can't be fetched."""
+        by_region = {}
+        for trust in cls.ods_trusts().values():
+            region = cls.NHS_REGION_NAMES.get(trust["region_code"])
+            if trust["closed"] or not region or not trust["icb_code"]:
+                continue
+            by_region.setdefault(region, set()).add(trust["icb_code"])
+        return {
+            region: sorted(cls.icb_name(code) for code in by_region[region])
+            for region in cls.NHS_REGION_NAMES.values() if region in by_region
+        }
 
     def organisation_ics(self, organisation):
-        """The Integrated Care System a requesting Organization resource's
-        address falls within, via organisation_geocode() (postcode ->
-        lat/lon) + icb_for_coordinates() (lat/lon -> ICB polygon) — used for
-        the /stats "by requesting organisation's ICS" choropleths in place
-        of the patient's own managingOrganization (which reflects where the
-        *patient* is registered, not where the order was *placed from*).
-        Returns None if the organisation has no resolvable postcode, or the
-        geocoded point doesn't fall inside any ICB polygon. Cached per
-        Organization id for the process lifetime — the same handful of
-        requesting organisations recur across a date range."""
-        if not organisation:
-            return None
-        key = organisation.get("id")
-        if key and key in self._org_ics_cache:
-            return self._org_ics_cache[key]
-        geocode = self.organisation_geocode(organisation)
-        result = self.icb_for_coordinates(geocode[0], geocode[1]) if geocode else None
-        # Not cached when geocoding came back empty for an organisation
-        # that does have a postcode — that may be a transient postcodes.io
-        # failure (geocode_postcode() caches definite answers itself).
-        if key and (result or not self.organisation_postcode(organisation)):
-            self._org_ics_cache[key] = result
-        return result
+        """The ICB an Organization belongs to, by its ODS code via the ODS
+        trust -> ICB mapping (trust_geography()) — no postcode lookup. Used
+        for every "by ICS" breakdown on /stats and /stats/monthly-reports.
+        None if the organisation has no ODS code, or isn't an NHS trust
+        ODS knows about."""
+        geo = self.trust_geography(self.organisation_ods_code(organisation))
+        return geo["icb_name"] if geo else None
 
     #: iGene report identifier system (NW Genomics IG-specific) — a local
     #: cross-reference id, e.g. into the iGene LIMS, that may be carried on

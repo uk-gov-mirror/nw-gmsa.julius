@@ -972,18 +972,22 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   off the report itself (`report_ordering_ods()`:
   `encounter.identifier.assigner`, else the PLAC-typed
   `basedOn.identifier.assigner`, skipping the report's own performer —
-  the GLH, e.g. `699X0`), then `organisation_by_ods()` resolves it to a
-  name/postcode (this server's Organization, topped up from the NHS ODS
-  API's `GeoLoc`), and the ICS is `organisation_ics()` on that. **Which of
+  the GLH, e.g. `699X0`), then `organisation_by_ods()` names it (ODS's
+  trust list for an NHS trust, else this server's Organization topped up
+  from the NHS ODS API), and the ICS/region come from ODS's trust → ICB
+  mapping (`FhirClient.trust_geography()`, see "ICS from the ODS trust →
+  ICB mapping" below). **Which of
   those assigners this server actually populates is unconfirmed** — if
   everything lands in "Unknown", sample a real report's `encounter`/
   `basedOn`. Each ICS row expands (client-side, hidden by default) into
   its trusts.
-- **NHS region filter** — `app.NHS_REGION_ICBS`, a hardcoded region →
-  official ICB23NM list (7 regions, 42 ICBs). Picking a region lists
-  *every* ICS in it, zero-filled. `ics_region()` maps any ICS name onto
-  this via the same `_normalize_icb_name()`/`_best_icb_match()` pair the
-  choropleths use.
+- **NHS region filter** — regions are `FhirClient.NHS_REGION_NAMES`
+  (the 7 ODS `Yxx` codes); the ICSs in each come from
+  `FhirClient.icbs_by_region()` (every open trust's ICB in ODS's trust
+  list), not a hardcoded list — ICBs merge (six new ones on 2025-11-13:
+  West and North London, Thames Valley, Surrey and Sussex, Essex, Central
+  East, Norfolk and Suffolk; 36 ICBs after). Picking a region lists
+  *every* current ICS in it, zero-filled.
 - **Categories are inferred from the test code** —
   `FhirClient.report_category()` (the report's own `code`),
   rules documented in its docstring: H&I (Histotrac codes, M118/R428/M242,
@@ -993,6 +997,33 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   *or* cancer) → remaining M/MX/HX = somatic cancer → remaining R/RX =
   variant reporting → else unclassified. Not a published mapping — adjust
   the rules there if a category looks wrong.
+
+### ICS from the ODS trust → ICB mapping
+
+Every "by ICS" breakdown (`/stats` tables, choropleths and `/stats/ics`
+drill-down, `/stats/monthly-reports`) gets an organisation's ICS from
+**NHS ODS's own trust → ICB mapping**, by ODS code — not from its
+postcode. `FhirClient.ods_trusts()` downloads ODS's `etr.csv` NHS Trusts
+export once per process (`ODS_TRUSTS_REPORT_URL`, ~60KB; columns: code,
+name, region `Yxx`, ICB code, ..., postcode, close date);
+`trust_geography(ods)` returns ICB code/name and region (a 5-character
+site code falls back to its 3-character parent trust); `icb_name()`
+names an ICB code via the NHS ODS lookup API (cached), so merged/renamed
+ICBs come through with their current names. `organisation_ics(org)` is
+just `trust_geography(organisation_ods_code(org))`.
+
+- This **replaced** postcode → postcodes.io → point-in-polygon against
+  the ONS ICB boundaries (`icb_for_coordinates()`, removed). postcodes.io
+  is now only used for the `/stats` organisation **map markers**
+  (`organisation_geocode()`); the ONS boundaries only for drawing the
+  choropleths (`fetch_icb_boundaries()`).
+- **Only NHS trusts are in `etr.csv`** — a GP practice, private provider
+  or anything else with no trust row shows as "Unknown" ICS.
+- The ONS boundary set is **April 2023**, so the November 2025 merged
+  ICBs have no polygon: they're counted in the tables but listed as
+  unmatched under each choropleth.
+- A failed `etr.csv` download isn't cached (retried next request); the
+  monthly report shows an error banner and only ICSs with data.
 
 ### ctDNA summary (`/ctdna`)
 

@@ -2475,92 +2475,6 @@ def stats_ics():
     )
 
 
-#: NHS England region for each ICB, keyed by the official ONS ICB23NM name
-#: (what organisation_ics() returns). Hardcoded — the 42 ICBs and 7
-#: regions have been stable since ICBs were established in July 2022, and
-#: the ONS boundary dataset doesn't carry the region itself.
-NHS_REGION_ICBS = {
-    "North East and Yorkshire": [
-        "NHS Humber and North Yorkshire Integrated Care Board",
-        "NHS North East and North Cumbria Integrated Care Board",
-        "NHS South Yorkshire Integrated Care Board",
-        "NHS West Yorkshire Integrated Care Board",
-    ],
-    "North West": [
-        "NHS Cheshire and Merseyside Integrated Care Board",
-        "NHS Greater Manchester Integrated Care Board",
-        "NHS Lancashire and South Cumbria Integrated Care Board",
-    ],
-    "Midlands": [
-        "NHS Birmingham and Solihull Integrated Care Board",
-        "NHS Black Country Integrated Care Board",
-        "NHS Coventry and Warwickshire Integrated Care Board",
-        "NHS Derby and Derbyshire Integrated Care Board",
-        "NHS Herefordshire and Worcestershire Integrated Care Board",
-        "NHS Leicester, Leicestershire and Rutland Integrated Care Board",
-        "NHS Lincolnshire Integrated Care Board",
-        "NHS Northamptonshire Integrated Care Board",
-        "NHS Nottingham and Nottinghamshire Integrated Care Board",
-        "NHS Shropshire, Telford and Wrekin Integrated Care Board",
-        "NHS Staffordshire and Stoke-on-Trent Integrated Care Board",
-    ],
-    "East of England": [
-        "NHS Bedfordshire, Luton and Milton Keynes Integrated Care Board",
-        "NHS Cambridgeshire and Peterborough Integrated Care Board",
-        "NHS Hertfordshire and West Essex Integrated Care Board",
-        "NHS Mid and South Essex Integrated Care Board",
-        "NHS Norfolk and Waveney Integrated Care Board",
-        "NHS Suffolk and North East Essex Integrated Care Board",
-    ],
-    "London": [
-        "NHS North Central London Integrated Care Board",
-        "NHS North East London Integrated Care Board",
-        "NHS North West London Integrated Care Board",
-        "NHS South East London Integrated Care Board",
-        "NHS South West London Integrated Care Board",
-    ],
-    "South East": [
-        "NHS Buckinghamshire, Oxfordshire and Berkshire West Integrated Care Board",
-        "NHS Frimley Integrated Care Board",
-        "NHS Hampshire and Isle of Wight Integrated Care Board",
-        "NHS Kent and Medway Integrated Care Board",
-        "NHS Surrey Heartlands Integrated Care Board",
-        "NHS Sussex Integrated Care Board",
-    ],
-    "South West": [
-        "NHS Bath and North East Somerset, Swindon and Wiltshire Integrated Care Board",
-        "NHS Bristol, North Somerset and South Gloucestershire Integrated Care Board",
-        "NHS Cornwall and the Isles of Scilly Integrated Care Board",
-        "NHS Devon Integrated Care Board",
-        "NHS Dorset Integrated Care Board",
-        "NHS Gloucestershire Integrated Care Board",
-        "NHS Somerset Integrated Care Board",
-    ],
-}
-
-
-def ics_region(ics_name):
-    """(official ICB name, NHS region) for an ICS name — exact match on
-    NHS_REGION_ICBS first, then the same normalise/fuzzy match the /stats
-    choropleth uses (_normalize_icb_name()/_best_icb_match()), so a
-    differently-worded name still lands on the right ICB. (ics_name,
-    None) if it matches no ICB (including "Unknown"). Memoised per name —
-    called once per report on the monthly report."""
-    if ics_name in _ics_region_cache:
-        return _ics_region_cache[ics_name]
-    by_norm = {
-        _normalize_icb_name(icb): (icb, region)
-        for region, icbs in NHS_REGION_ICBS.items() for icb in icbs
-    }
-    norm = _normalize_icb_name(ics_name)
-    best = norm if norm in by_norm else _best_icb_match(norm, by_norm.keys())
-    _ics_region_cache[ics_name] = by_norm[best] if best else (ics_name, None)
-    return _ics_region_cache[ics_name]
-
-
-_ics_region_cache = {}
-
-
 def short_icb_name(icb_name):
     """"NHS Greater Manchester Integrated Care Board" -> "Greater
     Manchester" — just for column/row labels on the monthly report."""
@@ -2598,9 +2512,10 @@ def monthly_reports():
     `_include=DiagnosticReport:based-on` chain made a month's search 413 on
     production). The trust is the ordering organisation's ODS code read off
     the report (client.report_ordering_ods(): encounter identifier
-    assigner, else placer-number assigner), resolved to a name/postcode by
-    client.organisation_by_ods(); the ICS is the ICB that postcode falls in
-    (organisation_ics()). Category is FhirClient.report_category() on the
+    assigner, else placer-number assigner), named via
+    client.organisation_by_ods(); its ICS and NHS region come from ODS's
+    own trust -> ICB mapping (FhirClient.trust_geography()), not a
+    postcode lookup. Category is FhirClient.report_category() on the
     report's own code.
 
     Queried one month at a time (reports_in_range() per month) rather than
@@ -2630,6 +2545,7 @@ def monthly_reports():
     category_labels = dict(FhirClient.REPORT_CATEGORIES)
     # ics -> month -> category -> count; ics -> trust -> month -> category -> count
     ics_counts, trust_counts = {}, {}
+    ics_region_names = {}  # ICB name -> NHS region name, for ICBs seen in the data
     truncated_months = []
     try:
         seen = set()
@@ -2648,7 +2564,10 @@ def monthly_reports():
                 seen.add(r.get("id"))
                 ordering_ods = client.report_ordering_ods(r)
                 org = client.organisation_by_ods(ordering_ods)
-                ics, _ = ics_region(client.organisation_ics(org) or "Unknown")
+                geo = FhirClient.trust_geography(ordering_ods)
+                ics = geo["icb_name"] if geo else "Unknown"
+                if geo:
+                    ics_region_names[ics] = geo["region_name"]
                 trust = _org_display_name(org.get("name") or ordering_ods, ordering_ods) if org else (ordering_ods or "Unknown")
                 category = FhirClient.report_category(r.get("code"))
                 by_cat = ics_counts.setdefault(ics, {}).setdefault(month, {})
@@ -2664,14 +2583,25 @@ def monthly_reports():
             return cats.get(selected_category, 0)
         return sum(cats.values())
 
-    # Every ICB in the selected region (or all regions) is listed, zero-filled,
-    # so a region view shows its whole ICS list; ICS names that didn't match
-    # an ICB (incl. "Unknown") only appear in the all-regions view.
+    # Every current ICB in the selected region (or all regions) is listed,
+    # zero-filled, so a region view shows its whole ICS list — from ODS's
+    # trust list (FhirClient.icbs_by_region()), not a hardcoded one, since
+    # ICBs merge. An ICB with data that isn't current (a trust that's since
+    # closed) is still listed under its region; "Unknown" (no ODS trust
+    # mapping) only appears in the all-regions view.
+    icbs_by_region = FhirClient.icbs_by_region()
+    for region, icbs in icbs_by_region.items():
+        for icb in icbs:
+            ics_region_names.setdefault(icb, region)
+    regions = list(FhirClient.NHS_REGION_NAMES.values())
     if selected_region:
-        ics_list = list(NHS_REGION_ICBS.get(selected_region, []))
+        ics_list = list(icbs_by_region.get(selected_region, []))
+        ics_list += sorted(i for i in ics_counts if i not in ics_list and ics_region_names.get(i) == selected_region)
     else:
-        ics_list = [icb for icbs in NHS_REGION_ICBS.values() for icb in icbs]
+        ics_list = [icb for icbs in icbs_by_region.values() for icb in icbs]
         ics_list += sorted(i for i in ics_counts if i not in ics_list)
+    if not icbs_by_region and not error:
+        error = "Couldn't download the NHS ODS trust list, so ICS couldn't be worked out — showing only ICSs with data."
 
     ics_rows = []
     for ics in ics_list:
@@ -2684,7 +2614,7 @@ def monthly_reports():
         trusts.sort(key=lambda t: -t["total"])
         ics_months = [count(month_cats, mo) for mo in months]
         ics_rows.append({
-            "name": ics, "label": short_icb_name(ics), "region": ics_region(ics)[1] or "—",
+            "name": ics, "label": short_icb_name(ics), "region": ics_region_names.get(ics) or "—",
             "months": ics_months, "total": sum(ics_months), "trusts": trusts,
         })
 
@@ -2704,7 +2634,7 @@ def monthly_reports():
     return render_template(
         "monthly_reports.html", error=error,
         start_month=start_month, end_month=end_month, months=months,
-        regions=list(NHS_REGION_ICBS), selected_region=selected_region,
+        regions=regions, selected_region=selected_region,
         categories=FhirClient.REPORT_CATEGORIES, selected_category=selected_category,
         selected_category_label=category_labels.get(selected_category),
         ics_rows=ics_rows, month_totals=month_totals, category_rows=category_rows,

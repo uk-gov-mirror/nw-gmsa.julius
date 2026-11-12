@@ -93,15 +93,17 @@
     <p class="muted">No orders in this range.</p>
   {% endif %}
 <h2>Orders by requesting organisation's ICS</h2>
-<p class="muted">Integrated Care System the requesting organisation's postcode falls within.</p>
+<p class="muted">Integrated Care Board the requesting organisation belongs to, from NHS ODS's own trust → ICB mapping (by the organisation's ODS code). Organisations that aren't NHS trusts show as "Unknown".</p>
 {% if order_ics_map_html %}
 <div>{{ order_ics_map_html|safe }}</div>
 <p class="muted">
-    Shaded by NHS Integrated Care Board (ONS boundaries), located from
-    each requesting organisation's geocoded postcode.
+    Shaded by NHS Integrated Care Board, drawn with the ONS April 2023
+    ICB boundaries — ICBs created since (the November 2025 mergers, e.g.
+    Central East, Thames Valley) have no boundary there, so they're only
+    in the table below.
     {% if order_ics_map_unmatched_count %}
     {{ order_ics_map_unmatched_count }} order(s) whose requesting
-    organisation's ICS couldn't be determined aren't shown on the map
+    organisation's ICS is unknown or has no 2023 boundary aren't shown on the map
     (still counted in the table below): {{ order_ics_map_unmatched_names|join(", ") }}.
     {% endif %}
 </p>
@@ -188,15 +190,17 @@
 {% endif %}
 
 <h2>Reports by ordering provider's ICS</h2>
-<p class="muted">Integrated Care System the ordering provider's postcode falls within.</p>
+<p class="muted">Integrated Care Board the ordering provider belongs to, from NHS ODS's own trust → ICB mapping (by the organisation's ODS code). Organisations that aren't NHS trusts show as "Unknown".</p>
 {% if report_ics_map_html %}
 <div>{{ report_ics_map_html|safe }}</div>
 <p class="muted">
-    Shaded by NHS Integrated Care Board (ONS boundaries), located from
-    each ordering provider's geocoded postcode.
+    Shaded by NHS Integrated Care Board, drawn with the ONS April 2023
+    ICB boundaries — ICBs created since (the November 2025 mergers, e.g.
+    Central East, Thames Valley) have no boundary there, so they're only
+    in the table below.
     {% if report_ics_map_unmatched_count %}
     {{ report_ics_map_unmatched_count }} report(s) whose ordering
-    provider's ICS couldn't be determined aren't shown on the map
+    provider's ICS is unknown or has no 2023 boundary aren't shown on the map
     (still counted in the table below): {{ report_ics_map_unmatched_names|join(", ") }}.
     {% endif %}
 </p>
