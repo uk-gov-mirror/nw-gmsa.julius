@@ -4397,6 +4397,7 @@ class FhirClient:
         ("hi", "Histocompatibility and Immunogenetic Reporting"),
         ("cytogenomic", "Cytogenomic Reporting"),
         ("variant", "Variant reporting"),
+        ("no_test", "No test performed (storage / not processed)"),
         ("unclassified", "Unclassified"),
     ]
 
@@ -4406,6 +4407,28 @@ class FhirClient:
     #: NW Genomics' own local test codes (RX/MX/HX — tests not in the
     #: National Genomic Test Directory).
     NW_TEST_CODE_SYSTEM = "https://fhir.nwgenomics.nhs.uk/CodeSystem/NWTestCode"
+
+    #: iGene's own local test/panel codes — what most production reports
+    #: and orders actually carry, often as their only coding. The IG
+    #: publishes only a 3-code fragment of this CodeSystem and no mapping
+    #: to the Test Directory, so _categorise_igeap() reads the code and its
+    #: display text instead.
+    IGEAP_SYSTEM = "https://fhir.nwgenomics.nhs.uk/CodeSystem/IGEAP"
+    #: A Test Directory code embedded in an IGEAP display/code, e.g.
+    #: "PANEL: R208.1 - Inherited breast cancer..." or "R27.3_WGS".
+    _IGEAP_TEST_CODE = re.compile(r"(?<![A-Za-z0-9.])([RM]\d{1,3}\.\d{1,2})(?![0-9])")
+    #: An indication code in an IGEAP panel code, e.g. "M4_LUNG_GX",
+    #: "v2bM215_ENDO_POLE_PS", "CCP19v1_R131v5".
+    _IGEAP_INDICATION = re.compile(r"(?:^|_|v\d[a-z])([RM]\d{1,3})(?=_|v\d|$)")
+    _IGEAP_NO_TEST = re.compile(r"\bSTORE_TEST\b|\bNOT-P\b|storage only|not processed", re.I)
+    #: Haem-onc / solid tumour IGEAP tests with no indication code in them
+    #: (BCR::ABL1 and NPM1 MRD monitoring, PanHaem panels, fusion panels).
+    _IGEAP_SOMATIC = re.compile(
+        r"BCR::?ABL|\bNPM1\b|\bMRD\b|PanHaem|\bMPN\b|MYELOID|\bFusion\b|Solid Cancer|leukaemia|lymphoma|myeloma",
+        re.I)
+    #: Germline Sanger tests — predictive and family follow-up (rare
+    #: disease or inherited cancer) are variant reporting.
+    _IGEAP_VARIANT = re.compile(r"\bSANGER\b|Predictive|Family follow-up|Family-follow-up", re.I)
 
     #: LOINC report codes mapped straight to a REPORT_CATEGORIES key — for
     #: reports coded in LOINC rather than (or as well as) a test code.
@@ -4455,38 +4478,110 @@ class FhirClient:
         then cytogenomic techniques (karyotype, microarray, FISH, common
         aneuploidy — germline *or* cancer), then any remaining M/MX/HX
         code is somatic cancer and any remaining R/RX code is variant
-        reporting. A CodeableConcept with no recognised test code can still
-        be categorised by a LOINC code in LOINC_REPORT_CATEGORIES (e.g.
-        33893-9, bone marrow karyotype -> cytogenomic) — checked per
-        CodeableConcept, so a report's own LOINC code beats its order's
-        test code. For M codes, bracketed text is ignored when matching
+        reporting.
+
+        Precedence across all the CodeableConcepts: any recognised test
+        code (Test Directory / NW local / Histotrac — report's first, then
+        order's) wins; then a LOINC code in LOINC_REPORT_CATEGORIES (e.g.
+        33893-9, bone marrow karyotype -> cytogenomic); then, last, an
+        iGene IGEAP code (_categorise_igeap()) — so an order's Test
+        Directory code beats a LOINC or IGEAP code on the report. For M codes, bracketed text is ignored when matching
         technique keywords — those brackets list gene/variant detail
         ("...structural variant (To include ... Monosomal karyotype)"),
         not the test's own technique, unlike an R code's trailing
         "(Karyotype)"/"(WGS)"."""
+        # 1. England Test Directory / NW local / Histotrac test codes — on
+        #    any of the CodeableConcepts (the report's own first, then its
+        #    order's) — before anything else, so an order's R/M code beats
+        #    a local code on the report.
         for cc in codeable_concepts:
             code, display, system = cls._test_code_and_display(cc)
             if not code:
-                for coding in (cc or {}).get("coding", []):
-                    if coding.get("system") == cls.LOINC_SYSTEM and coding.get("code") in cls.LOINC_REPORT_CATEGORIES:
-                        return cls.LOINC_REPORT_CATEGORIES[coding["code"]]
                 continue
             if system == cls.HISTOTRAC_TEST_CODE_SYSTEM:
                 return "hi"
-            text = re.sub(r"\([^)]*\)", "", display) if code.startswith("M") else display
-            if code.startswith(cls._HI_CODE_PREFIXES) or cls._HI_TEXT.search(text):
-                return "hi"
-            if code.startswith(cls._PGX_CODE_PREFIXES) or cls._PGX_TEXT.search(text):
-                return "pharmacogenomics"
-            if cls._WGS_TEXT.search(text):
-                return "cancer_wgs" if code.startswith(("M", "HX")) else "wgs"
-            if cls._CYTOGENOMIC_TEXT.search(text):
-                return "cytogenomic"
-            if code.startswith(("M", "HX")):
-                return "somatic"
-            if code.startswith("R"):
-                return "variant"
+            category = cls._categorise_test_code(code, display)
+            if category:
+                return category
+        # 2. Mapped LOINC codes.
+        for cc in codeable_concepts:
+            for coding in (cc or {}).get("coding", []):
+                if coding.get("system") == cls.LOINC_SYSTEM and coding.get("code") in cls.LOINC_REPORT_CATEGORIES:
+                    return cls.LOINC_REPORT_CATEGORIES[coding["code"]]
+        # 3. iGene IGEAP codes, last — a fallback for reports/orders
+        #    missing their Test Directory code.
+        for cc in codeable_concepts:
+            for coding in (cc or {}).get("coding", []):
+                if coding.get("system") == cls.IGEAP_SYSTEM and coding.get("code"):
+                    category = cls._categorise_igeap(coding["code"], coding.get("display") or (cc or {}).get("text") or "")
+                    if category:
+                        return category
         return "unclassified"
+
+    @classmethod
+    def _categorise_test_code(cls, code, display):
+        """REPORT_CATEGORIES key for one Test Directory / NW local test
+        code and its display text (rules in report_category()'s
+        docstring), or None if it's neither an R/RX nor an M/MX/HX code."""
+        text = re.sub(r"\([^)]*\)", "", display) if code.startswith("M") else display
+        if code.startswith(cls._HI_CODE_PREFIXES) or cls._HI_TEXT.search(text):
+            return "hi"
+        if code.startswith(cls._PGX_CODE_PREFIXES) or cls._PGX_TEXT.search(text):
+            return "pharmacogenomics"
+        if cls._WGS_TEXT.search(text):
+            return "cancer_wgs" if code.startswith(("M", "HX")) else "wgs"
+        if cls._CYTOGENOMIC_TEXT.search(text):
+            return "cytogenomic"
+        if code.startswith(("M", "HX")):
+            return "somatic"
+        if code.startswith("R"):
+            return "variant"
+        return None
+
+    @classmethod
+    def _categorise_igeap(cls, code, display):
+        """REPORT_CATEGORIES key for an iGene IGEAP code + display, or
+        None. In order:
+
+        1. "DNA Storage Only" / "Not Processed" -> "no_test" (nothing was
+           reported, so no category fits).
+        2. A Test Directory code embedded in the display or code
+           ("PANEL: R208.1 - ...", "R27.3_WGS") -> categorised exactly as
+           that code, its Test Directory display plus the IGEAP display
+           as the text.
+        3. An indication code in the panel code ("M4_LUNG_GX",
+           "v2bM215_ENDO_POLE_PS", "CCP19v1_R131v5") -> categorised as an
+           M (cancer) or R (germline) code, with the IGEAP display as text.
+        4. The usual technique rules on the text (H&I, PGx, WGS,
+           cytogenomic — e.g. "SNP Microarray"), then haem-onc/solid tumour
+           keywords (BCR::ABL1, NPM1, MRD, PanHaem, fusion) -> somatic, then
+           Sanger predictive / family follow-up -> variant reporting.
+        """
+        text = f"{code} {display}"
+        if cls._IGEAP_NO_TEST.search(text):
+            return "no_test"
+        embedded = cls._IGEAP_TEST_CODE.search(display) or cls._IGEAP_TEST_CODE.search(code)
+        if embedded:
+            test_code = embedded.group(1)
+            td_display = cls.genomic_test_directory_display(test_code)
+            td_display = "" if td_display == test_code else td_display
+            return cls._categorise_test_code(test_code, f"{td_display} {display}")
+        indication = cls._IGEAP_INDICATION.search(code)
+        if indication:
+            return cls._categorise_test_code(indication.group(1), text)
+        if cls._HI_TEXT.search(text):
+            return "hi"
+        if cls._PGX_TEXT.search(text):
+            return "pharmacogenomics"
+        if cls._WGS_TEXT.search(text):
+            return "wgs"
+        if cls._CYTOGENOMIC_TEXT.search(text):
+            return "cytogenomic"
+        if cls._IGEAP_SOMATIC.search(text):
+            return "somatic"
+        if cls._IGEAP_VARIANT.search(text):
+            return "variant"
+        return None
 
     #: This IG's own CodeSystem for clinical indications — confirmed by
     #: the worked example's own ServiceRequest.reasonCode

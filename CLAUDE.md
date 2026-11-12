@@ -1009,14 +1009,31 @@ month that hits the page cap is flagged on the page as possibly incomplete.
 - **"Reports actually delivered"** — reports whose ordering trust
   receives them electronically: counts and % of the total per status (Live
   / Nearing go-live / Not live), then the **top 10 recommended target
-  trusts** by volume that are neither live nor nearing go-live, each with
-  a cumulative "delivered if live" % on top of live + nearing-go-live.
+  trusts** by volume that are neither live nor nearing go-live (reports
+  and % of total each).
   Live status is **maintained by hand** in `app.TRUST_DELIVERY_STATUS`
   (by ODS code: `R0A` MFT live; `RBS` Alder Hey and `REP` Liverpool
   Women's nearing go-live as of 2026-11) — update it as trusts go live.
   Uses the same ICS list (region filter) and counting (category filter) as
   the ICS table, so totals match. `_delivery_summary()` in `app.py`; also
   in the PDF.
+- **iGene IGEAP codes** (`https://fhir.nwgenomics.nhs.uk/CodeSystem/IGEAP`)
+  are what most production reports/orders carry — often *only* that, with
+  no England Test Directory code in `DiagnosticReport.code`, which they
+  should have (a data-feed gap). **Precedence in `report_category()`:**
+  any Test Directory / NW local / Histotrac code on the report *or* its
+  order first, then mapped LOINC codes, then IGEAP last — so an order's
+  Test Directory code beats an IGEAP-only report. Failing those, `FhirClient._categorise_igeap()` reads
+  the IGEAP code/display: "DNA Storage Only"/"Not Processed" → new
+  `no_test` category; an embedded Test Directory code ("PANEL: R208.1 -
+  ...", "R27.3_WGS") → categorised as that code; an indication in the
+  panel code ("M4_LUNG_GX", "v2bM215_...", "CCP19v1_R131v5") → as an M/R
+  code; then technique rules (e.g. "SNP Microarray" → cytogenomic),
+  haem-onc/solid keywords (BCR::ABL1, NPM1 MRD, PanHaem, fusion) →
+  somatic, Sanger predictive/family follow-up → variant. Checked against
+  the top 25 production unclassified IGEAP codes (all categorised); the
+  IG only publishes a 3-code fragment of IGEAP and no mapping, so these
+  rules are inferred.
 - **"Unclassified reports — what codes do they carry?"** — a collapsed
   section under "Reports by category" listing the most common (report
   code, order code) combinations among unclassified reports
@@ -1026,10 +1043,13 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   (SNOMED "Genetic report", iGene local codes, other LOINC, text only, ...)
   — map it in `report_category()`/`LOINC_REPORT_CATEGORIES`. Not in the PDF.
 - **A report's ServiceRequest is fetched when it lacks an ODS code *or* a
-  categorisable code** (`_orders_index_for_reports()`) — originally only
-  the former, so a report coded only as SNOMED "Genetic report" but
-  carrying its own ODS code never got its order's R/M code and stayed
-  Unclassified.
+  Test Directory / NW local / Histotrac code of its own**
+  (`_orders_index_for_reports()`) — originally only the former, so a
+  report coded only as SNOMED "Genetic report" but carrying its own ODS
+  code never got its order's R/M code and stayed Unclassified. It's "lacks
+  a Test Directory code", not "can't be categorised", because an
+  IGEAP-only report *can* be categorised from IGEAP, but its order's Test
+  Directory code takes precedence.
 - **"Download as PDF"** (`/stats/monthly-reports/pdf`, same query string
   as the page) — `pdf_report.monthly_report_pdf_bytes()`, reportlab,
   landscape A4, same pattern as `/data-quality/pdf`. Both routes build
@@ -1063,9 +1083,10 @@ month that hits the page cap is flagged on the page as possibly incomplete.
   rest as "Whole Genomic Sequencing") → cytogenomic (karyotype/microarray/FISH/aneuploidy, germline
   *or* cancer) → remaining M/MX/HX = somatic cancer → remaining R/RX =
   variant reporting → else unclassified. A CodeableConcept with no
-  recognised test code can still match a LOINC code in
-  `FhirClient.LOINC_REPORT_CATEGORIES` (`33893-9`, bone marrow karyotype →
-  cytogenomic) — add more there as they turn up in "Unclassified". Not a published mapping — adjust
+  recognised test code (on the report or its order) can still match a
+  LOINC code in `FhirClient.LOINC_REPORT_CATEGORIES` (`33893-9`, bone
+  marrow karyotype → cytogenomic), then an IGEAP code — add more there as
+  they turn up in "Unclassified". Not a published mapping — adjust
   the rules there if a category looks wrong.
 
 ### ICS from the ODS trust → ICB mapping

@@ -2250,14 +2250,16 @@ def _orders_index_for_reports(reports, orders=()):
     batches by client.service_requests_for_reports() (`_id=a,b,c,...`, no
     `_include`). Most production reports carry the trust's ODS code only
     on their ServiceRequest (requester.identifier), so without this most
-    of them came out "Unknown"; and a report coded only as e.g. SNOMED
-    "Genetic report" needs its order's R/M code to be categorised — an
-    earlier version only fetched for the missing-ODS case, so such a
-    report with its own ODS code stayed "Unclassified"."""
+    of them came out "Unknown"; and a report with no Test Directory /
+    NW local / Histotrac code of its own (only SNOMED "Genetic report", or
+    only an iGene IGEAP code) needs its order's R/M code — report_category()
+    prefers that over any LOINC/IGEAP code, so the order is fetched
+    whenever the report itself lacks one, not only when the report can't
+    be categorised at all."""
     index = FhirClient.index_orders(orders)
     missing = [
         r for r in reports
-        if (not client.report_ordering_ods(r) or FhirClient.report_category(r.get("code")) == "unclassified")
+        if (not client.report_ordering_ods(r) or not FhirClient._test_code_and_display(r.get("code"))[0])
         and not client.match_report_order(r, index)
     ]
     if missing:
@@ -2613,9 +2615,7 @@ def _delivery_summary(trust_totals, total):
     {(trust label, ODS code or None, ICS): report count} — counts and % of
     `total` per TRUST_DELIVERY_STATUS status, and the top
     DELIVERY_TARGETS_SHOWN trusts by volume that are neither live nor
-    already nearing go-live, as recommended targets — each with the
-    delivered % if it (and every target above it) went live, on top of the
-    live *and* nearing-go-live trusts (`baseline_pct`). Trusts with no ODS
+    already nearing go-live, as recommended targets. Trusts with no ODS
     code ("Unknown") are counted but can't be targets."""
     def pct(n):
         return round(100 * n / total, 1) if total else 0.0
@@ -2631,20 +2631,16 @@ def _delivery_summary(trust_totals, total):
             "trusts": sorted(label for label, _ in trusts) if status else [],
         })
 
-    baseline = statuses[0]["reports"] + statuses[1]["reports"]
     candidates = sorted(
         ((label, ods, ics, n) for (label, ods, ics), n in trust_totals.items()
          if ods and n and not TRUST_DELIVERY_STATUS.get(ods)),
         key=lambda t: (-t[3], t[0]),
     )[:DELIVERY_TARGETS_SHOWN]
-    targets, running = [], baseline
-    for label, ods, ics, n in candidates:
-        running += n
-        targets.append({
-            "name": label, "ics": short_icb_name(ics) if ics != "Unknown" else "Unknown",
-            "reports": n, "pct": pct(n), "cumulative_pct": pct(running),
-        })
-    return {"total": total, "statuses": statuses, "targets": targets, "baseline_pct": pct(baseline)}
+    targets = [
+        {"name": label, "ics": short_icb_name(ics) if ics != "Unknown" else "Unknown", "reports": n, "pct": pct(n)}
+        for label, ods, ics, n in candidates
+    ]
+    return {"total": total, "statuses": statuses, "targets": targets}
 
 
 #: How many distinct code combinations the "Unclassified reports" table lists.
@@ -2834,7 +2830,7 @@ def _build_monthly_report():
             sum(ics_counts.get(ics, {}).get(mo, {}).get(key, 0) for ics in ics_list)
             for mo in months
         ]
-        if key != "unclassified" or sum(cat_months):
+        if key not in ("unclassified", "no_test") or sum(cat_months):
             category_rows.append({"key": key, "label": label, "months": cat_months, "total": sum(cat_months)})
 
     return dict(

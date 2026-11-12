@@ -299,13 +299,11 @@ def monthly_report_pdf_bytes(report):
             story.append(Spacer(1, 8))
             story.append(_para(
                 f"<b>Recommended targets</b> &mdash; top {len(delivery['targets'])} trusts by volume, not yet live or "
-                f"nearing go-live. &ldquo;Delivered if live&rdquo; is the delivered % if that trust and every trust above "
-                f"it went live, on top of the live and nearing-go-live trusts ({delivery['baseline_pct']}% between them)."))
-            rows = [["#", "NHS trust", "ICS", "Reports", "% of total", "Delivered if live"]]
+                f"nearing go-live: taking these live would deliver the most extra reports."))
+            rows = [["#", "NHS trust", "ICS", "Reports", "% of total"]]
             for i, tg in enumerate(delivery["targets"], 1):
-                rows.append([i, _name_cell(tg["name"]), _name_cell(tg["ics"]), tg["reports"],
-                             f"{tg['pct']}%", f"{tg['cumulative_pct']}%"])
-            t = Table(rows, colWidths=[25, _CONTENT_WIDTH - 450, 170, 70, 85, 100], repeatRows=1)
+                rows.append([i, _name_cell(tg["name"]), _name_cell(tg["ics"]), tg["reports"], f"{tg['pct']}%"])
+            t = Table(rows, colWidths=[25, _CONTENT_WIDTH - 350, 170, 70, 85], repeatRows=1)
             t.setStyle(_TABLE_STYLE)
             story.append(t)
 
